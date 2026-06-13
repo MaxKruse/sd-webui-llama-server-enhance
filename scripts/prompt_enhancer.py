@@ -17,8 +17,10 @@ from modules.processing import StableDiffusionProcessing
 
 from prompt_enhancer import settings as _settings_module
 from prompt_enhancer.llm import (
+    ChatResult,
     _SERVER_STARTUP_TIMEOUT,
     _build_command,
+    _discover_model_name,
     _find_free_port,
     _wait_for_server,
     _batch_chat_completions,
@@ -67,6 +69,31 @@ def _build_resolution_instruction(width: int, height: int) -> str:
     )
 
 
+def _build_negative_prompt_instruction() -> str:
+    """Build a negative-prompt-enhancement instruction block for the LLM system prompt.
+
+    Appended to the preset when the user checks 'Also enhance negative prompt'.
+    The LLM receives the enhanced positive prompt for context and the original
+    negative prompt to enhance.
+    """
+    return (
+        "\n\n--- Negative Prompt Enhancement ---\n"
+        "You are now enhancing a NEGATIVE prompt. The user message contains:\n"
+        "  - 'POSITIVE: ' followed by the already-enhanced positive prompt (for context only)\n"
+        "  - 'NEGATIVE: ' followed by the original negative prompt to enhance\n\n"
+        "Your job: enhance the negative prompt to best complement the positive prompt.\n"
+        "Take the positive prompt into account — target unwanted elements that would"
+        "conflict with the desired output.\n\n"
+        "Output ONLY the enhanced negative prompt as a single line of text.\n"
+        "Do not include the positive prompt, explanations, or any other commentary.\n"
+    )
+
+
+def _build_negative_user_prompt(positive: str, negative: str) -> str:
+    """Format a user message for the negative-prompt-enhancement call."""
+    return f"POSITIVE: {positive}\n\nNEGATIVE: {negative}"
+
+
 def _build_dp_wildcard_instruction() -> str:
     """Build a wildcard-preservation instruction for the LLM system prompt.
 
@@ -95,13 +122,16 @@ def _build_dp_wildcard_instruction() -> str:
     )
 
 
-def _effective_system_prompt(
+def _build_base_system_prompt(
     preset_content: str,
     *,
     width: int = 0,
     height: int = 0,
 ) -> str:
-    """Return the preset content with optional resolution and DP instructions appended."""
+    """Return the preset content with optional resolution and DP instructions appended.
+
+    This is the shared base used for BOTH positive and negative enhancement calls.
+    """
     result = preset_content
 
     # Append resolution info if dimensions provided
@@ -114,6 +144,29 @@ def _effective_system_prompt(
         result += dp_instruction
 
     return result
+
+
+def _effective_system_prompt(
+    preset_content: str,
+    *,
+    width: int = 0,
+    height: int = 0,
+) -> str:
+    """System prompt for the positive-prompt enhancement call."""
+    return _build_base_system_prompt(preset_content, width=width, height=height)
+
+
+def _effective_negative_system_prompt(
+    preset_content: str,
+    *,
+    width: int = 0,
+    height: int = 0,
+) -> str:
+    """System prompt for the negative-prompt enhancement call.
+
+    Same base as positive, plus the negative-enhancement instruction block.
+    """
+    return _build_base_system_prompt(preset_content, width=width, height=height) + _build_negative_prompt_instruction()
 
 
 class Script(scripts.Script):
@@ -160,6 +213,13 @@ class Script(scripts.Script):
                 interactive=True,
                 elem_id=self.elem_id("enhance-mode"),
             )
+            enhance_negative = gr.Checkbox(
+                value=False,
+                label="Also enhance negative prompt",
+                info="Ask the LLM to enhance the negative prompt too (uses the preset's negative prompt guidance)",
+                interactive=True,
+                elem_id=self.elem_id("enhance-negative"),
+            )
 
             def on_refresh():
                 choices = list_presets()
@@ -174,7 +234,7 @@ class Script(scripts.Script):
                 outputs=[preset_dropdown],
             )
 
-        return [enable, preset_dropdown, enhance_mode]
+        return [enable, preset_dropdown, enhance_mode, enhance_negative]
 
     def process(
         self,
@@ -182,11 +242,13 @@ class Script(scripts.Script):
         enable: bool,
         preset_name: str,
         enhance_mode: str,
+        enhance_negative: bool,
     ):
         """Called once before any sampling. Enhance prompts here."""
         _log_to_file("=" * 72)
-        _log_to_file(f"process() entered — enable={enable!r}, preset={preset_name!r}, mode={enhance_mode!r}")
+        _log_to_file(f"process() entered — enable={enable!r}, preset={preset_name!r}, mode={enhance_mode!r}, enhance_negative={enhance_negative!r}")
         _log_to_file(f"  p.all_prompts (input)  = {p.all_prompts!r}")
+        _log_to_file(f"  p.all_negative_prompts (input) = {p.all_negative_prompts!r}")
         _log_to_file(f"  p.n_iter = {p.n_iter}, p.batch_size = {p.batch_size}")
 
         if not enable:
@@ -203,13 +265,20 @@ class Script(scripts.Script):
             _log_to_file(f"  → preset '{preset_name}' not found, skipping")
             return
 
-        # Build effective system prompt (preset + resolution + Dynamic Prompts wildcard note)
+        # Build system prompts (preset + resolution + Dynamic Prompts wildcard note)
         system_prompt = _effective_system_prompt(
             preset_content,
             width=p.width,
             height=p.height,
         )
-        _log_to_file(f"  system_prompt ({len(system_prompt)} chars): {system_prompt}")
+        negative_system_prompt = _effective_negative_system_prompt(
+            preset_content,
+            width=p.width,
+            height=p.height,
+        ) if enhance_negative else None
+        _log_to_file(f"  system_prompt ({len(system_prompt)} chars): {system_prompt[:200]}...")
+        if negative_system_prompt:
+            _log_to_file(f"  negative_system_prompt ({len(negative_system_prompt)} chars): {negative_system_prompt[:200]}...")
 
         server_path = shared.opts.llama_enhance_server_path or "llama-server"
         model_path = shared.opts.llama_enhance_model_path
@@ -227,8 +296,11 @@ class Script(scripts.Script):
                 _log_to_file("  → Once mode: original prompt empty, skipping")
                 return
 
-            _log_to_file(f"  → Once mode: enhancing prompt 0 ({len(original)} chars)")
-            result = enhance_prompt(
+            original_negative = p.all_negative_prompts[0] if p.all_negative_prompts else ""
+
+            # Step 1: Enhance positive prompt
+            _log_to_file(f"  → Once mode: enhancing positive ({len(original)} chars)")
+            pos_result: ChatResult = enhance_prompt(
                 server_path=server_path,
                 model_path=model_path,
                 system_prompt=system_prompt,
@@ -236,32 +308,62 @@ class Script(scripts.Script):
                 extra_flags=extra_flags,
             )
 
-            if result:
-                _log_to_file(f"  → Once mode: enhanced ({len(result)} chars): {result}")
-                p.all_prompts = [result] * len(p.all_prompts)
-                logger.info(
-                    "Prompt enhanced (Once mode): %s → %s",
-                    original[:60],
-                    result[:60],
-                )
-                print(f"  Enhanced prompt (full): {result}")
-            else:
-                _log_to_file("  → Once mode: enhancement failed, keeping original")
+            if not pos_result.content:
+                _log_to_file("  → Once mode: positive enhancement failed, keeping original")
                 logger.info("Using original prompt (enhancement failed)")
                 print("  Using original prompt (enhancement failed)")
+                _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
+                _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
+                return
+
+            enhanced_positive = pos_result.content
+            _log_to_file(
+                f"  → Once mode: positive enhanced ({len(enhanced_positive)} chars, "
+                f"{pos_result.completion_tokens} tokens, {pos_result.generation_tps:.1f} tok/s, "
+                f"{pos_result.total_ms:.0f}ms total)"
+            )
+            print(f"  Enhanced prompt (full): {enhanced_positive}")
+
+            # Step 2: Enhance negative prompt (if enabled)
+            enhanced_negative = original_negative
+            if enhance_negative:
+                _log_to_file(f"  → Once mode: enhancing negative ({len(original_negative)} chars)")
+                neg_user_prompt = _build_negative_user_prompt(enhanced_positive, original_negative)
+                neg_result: ChatResult = enhance_prompt(
+                    server_path=server_path,
+                    model_path=model_path,
+                    system_prompt=negative_system_prompt,
+                    user_prompt=neg_user_prompt,
+                    extra_flags=extra_flags,
+                )
+
+                if neg_result.content:
+                    enhanced_negative = neg_result.content
+                    _log_to_file(
+                        f"  → Once mode: negative enhanced ({len(enhanced_negative)} chars, "
+                        f"{neg_result.completion_tokens} tokens, {neg_result.generation_tps:.1f} tok/s, "
+                        f"{neg_result.total_ms:.0f}ms total)"
+                    )
+                    print(f"  Enhanced negative (full): {enhanced_negative}")
+
+            p.all_prompts = [enhanced_positive] * len(p.all_prompts)
+            p.all_negative_prompts = [enhanced_negative] * len(p.all_negative_prompts)
+            logger.info("Prompt enhanced (Once mode): %s → %s", original[:60], enhanced_positive[:60])
+            logger.info("Negative: %s → %s", original_negative[:60], enhanced_negative[:60])
             _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
+            _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
             return
 
-        # "Per image" mode: start ONE server, send all prompts in parallel, collect all
+        # "Per image" mode: start ONE server, batch positives, then batch negatives
         _log_to_file(f"  → Per image mode: {len(p.all_prompts)} prompt(s)")
 
         # Collect prompts that need enhancement (skip empty ones)
         prompts_to_enhance: list[tuple[int, str]] = []
-        skipped_prompts: dict[int, str] = {}
+        skipped_indices: set[int] = set()
         for idx, original in enumerate(p.all_prompts):
             if not original.strip():
                 _log_to_file(f"  → prompt {idx}: empty, keeping as-is")
-                skipped_prompts[idx] = original
+                skipped_indices.add(idx)
             else:
                 prompts_to_enhance.append((idx, original))
 
@@ -320,42 +422,82 @@ class Script(scripts.Script):
             return
 
         ready_time = time.monotonic()
-        print(f"  Server ready on port {port} in {ready_time - start:.1f}s. Sending {len(prompts_to_enhance)} prompt(s) in parallel...")
+
+        # Discover the loaded model name
+        model_name = _discover_model_name(base_url)
+        _log_to_file(f"  Discovered model: {model_name}")
+        print(f"  Server ready on port {port} in {ready_time - start:.1f}s. Model: {model_name}")
         _log_to_file(f"  Server ready in {ready_time - start:.1f}s")
 
-        # Send all prompts concurrently
-        results = _batch_chat_completions(base_url, system_prompt, prompts_to_enhance)
+        # --- Step 1: Batch enhance positive prompts ---
+        print(f"  Sending {len(prompts_to_enhance)} positive prompt(s) in parallel...")
+        pos_results = _batch_chat_completions(base_url, model_name, system_prompt, prompts_to_enhance)
+        pos_result_map: dict[int, ChatResult] = {idx: result for idx, result in pos_results}
 
-        # Build enhanced prompt list preserving order
-        result_map = {idx: content for idx, content in results}
-        enhanced_prompts: list[str] = []
+        # Build enhanced positive list + track which indices succeeded
+        enhanced_prompts: list[str] = [""] * len(p.all_prompts)
+        successful_indices: list[int] = []
+
         for idx, original in enumerate(p.all_prompts):
-            if idx in skipped_prompts:
-                enhanced_prompts.append(original)
+            if idx in skipped_indices:
+                enhanced_prompts[idx] = original
                 continue
 
-            result = result_map.get(idx)
-            if result:
-                _log_to_file(f"  → prompt {idx}: enhanced ({len(result)} chars): {result}")
-                logger.info(
-                    "Prompt %d enhanced: %s → %s",
-                    idx + 1,
-                    original[:60],
-                    result[:60],
+            result = pos_result_map.get(idx)
+            if result and result.content:
+                _log_to_file(
+                    f"  → prompt {idx}: positive enhanced ({len(result.content)} chars, "
+                    f"{result.completion_tokens} tokens, {result.generation_tps:.1f} tok/s, "
+                    f"{result.total_ms:.0f}ms total)"
                 )
-                print(f"  Enhanced prompt {idx + 1} (full): {result}")
-                enhanced_prompts.append(result)
+                logger.info("Prompt %d enhanced: %s → %s", idx + 1, original[:60], result.content[:60])
+                print(f"  Enhanced prompt {idx + 1} (full): {result.content}")
+                enhanced_prompts[idx] = result.content
+                successful_indices.append(idx)
             else:
-                _log_to_file(f"  → prompt {idx}: enhancement failed, keeping original")
+                _log_to_file(f"  → prompt {idx}: positive enhancement failed, keeping original")
                 logger.info("Prompt %d: using original (enhancement failed)", idx + 1)
                 print(f"  Prompt {idx + 1}: using original (enhancement failed)")
-                enhanced_prompts.append(original)
+                enhanced_prompts[idx] = original
+
+        # --- Step 2: Batch enhance negative prompts (if enabled) ---
+        # Start with original negatives as baseline (pad with empty strings if needed)
+        enhanced_negatives: list[str] = list(p.all_negative_prompts)
+        while len(enhanced_negatives) < len(enhanced_prompts):
+            enhanced_negatives.append("")
+
+        if enhance_negative and successful_indices:
+            neg_prompts: list[tuple[int, str]] = []
+            for idx in successful_indices:
+                original_negative = p.all_negative_prompts[idx] if idx < len(p.all_negative_prompts) else ""
+                neg_user_prompt = _build_negative_user_prompt(enhanced_prompts[idx], original_negative)
+                neg_prompts.append((idx, neg_user_prompt))
+
+            print(f"  Sending {len(neg_prompts)} negative prompt(s) in parallel...")
+            neg_results = _batch_chat_completions(base_url, model_name, negative_system_prompt, neg_prompts)
+            neg_result_map: dict[int, ChatResult] = {idx: result for idx, result in neg_results}
+
+            for idx in successful_indices:
+                original_negative = p.all_negative_prompts[idx] if idx < len(p.all_negative_prompts) else ""
+                result = neg_result_map.get(idx)
+                if result and result.content:
+                    _log_to_file(
+                        f"  → prompt {idx}: negative enhanced ({len(result.content)} chars, "
+                        f"{result.completion_tokens} tokens, {result.generation_tps:.1f} tok/s, "
+                        f"{result.total_ms:.0f}ms total)"
+                    )
+                    logger.info("Negative %d enhanced: %s → %s", idx + 1, original_negative[:60], result.content[:60])
+                    print(f"  Enhanced negative {idx + 1} (full): {result.content}")
+                    enhanced_negatives[idx] = result.content
+                # else: keep original negative (already set as baseline)
 
         # Kill the server
         _kill_server(server_proc)
 
         p.all_prompts = enhanced_prompts
+        p.all_negative_prompts = enhanced_negatives
         _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
+        _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
 
 
 # Register settings callback on import

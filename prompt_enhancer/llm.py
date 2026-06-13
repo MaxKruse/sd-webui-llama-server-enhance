@@ -114,25 +114,86 @@ def _wait_for_server(base_url: str, timeout: int = _SERVER_STARTUP_TIMEOUT) -> b
 _print_lock = Lock()
 
 
+class ChatResult:
+    """Result from a single chat completion, including timing stats."""
+    __slots__ = ("content", "prompt_tokens", "completion_tokens", "prompt_ms", "predicted_ms")
+
+    def __init__(
+        self,
+        content: str | None = None,
+        *,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        prompt_ms: float = 0.0,
+        predicted_ms: float = 0.0,
+    ):
+        self.content = content
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.prompt_ms = prompt_ms
+        self.predicted_ms = predicted_ms
+
+    @property
+    def prompt_tps(self) -> float:
+        """Tokens per second for prompt processing."""
+        return self.prompt_tokens / (self.prompt_ms / 1000) if self.prompt_ms > 0 else 0.0
+
+    @property
+    def generation_tps(self) -> float:
+        """Tokens per second for token generation."""
+        return self.completion_tokens / (self.predicted_ms / 1000) if self.predicted_ms > 0 else 0.0
+
+    @property
+    def total_ms(self) -> float:
+        """Total inference time in milliseconds."""
+        return self.prompt_ms + self.predicted_ms
+
+    def __bool__(self):
+        return bool(self.content)
+
+
+def _discover_model_name(base_url: str) -> str:
+    """Fetch the currently loaded model name from /v1/models.
+
+    Prefers the model whose status is "loaded". Falls back to the first
+    model in the list, then to "llama" if nothing is available.
+    """
+    try:
+        with request.urlopen(f"{base_url}/v1/models", timeout=_HTTP_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            models = data.get("data", [])
+            # Prefer the loaded model
+            for m in models:
+                status = m.get("status", {})
+                if isinstance(status, dict) and status.get("value") == "loaded":
+                    return m.get("id", "llama")
+            # Fallback: first model
+            if models:
+                return models[0].get("id", "llama")
+    except (error.URLError, json.JSONDecodeError, KeyError):
+        pass
+    return "llama"
+
+
 def _chat_completion(
     base_url: str,
+    model_name: str,
     system_prompt: str,
     user_prompt: str,
-) -> str | None:
-    """Send a single chat completion request and return the assistant's content.
+) -> ChatResult:
+    """Send a single chat completion request and return a ChatResult.
 
     Uses the OpenAI-compatible /v1/chat/completions endpoint.
     The server automatically strips reasoning_content from content.
+    Inference params (max_tokens, temperature, top_p) are omitted so the
+    server uses its own defaults.
     """
     payload = {
-        "model": "llama",
+        "model": model_name,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "max_tokens": 4096,
-        "temperature": 0.8,
-        "top_p": 0.95,
     }
 
     data = json.dumps(payload).encode("utf-8")
@@ -150,55 +211,76 @@ def _chat_completion(
         with request.urlopen(req, timeout=120) as resp:
             result = json.loads(resp.read().decode("utf-8"))
             content = result["choices"][0]["message"]["content"]
-            return content.strip() if content else None
+
+            # Extract token counts from usage
+            usage = result.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", usage.get("prompt_n", 0))
+            completion_tokens = usage.get("completion_tokens", usage.get("predicted_n", 0))
+
+            # Extract timing from the timings block (llama-server)
+            timings = result.get("timings", {})
+            prompt_ms = timings.get("prompt_ms", 0)
+            predicted_ms = timings.get("predicted_ms", 0)
+
+            return ChatResult(
+                content=content.strip() if content else None,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                prompt_ms=prompt_ms,
+                predicted_ms=predicted_ms,
+            )
     except (error.URLError, json.JSONDecodeError, KeyError, IndexError) as exc:
         logger.error("Chat completion request failed: %s", exc)
-        return None
+        return ChatResult()
 
 
 def _chat_completion_with_index(
     base_url: str,
+    model_name: str,
     system_prompt: str,
     user_prompt: str,
     index: int,
-) -> tuple[int, str | None]:
-    """Send a single chat completion and return (index, content)."""
-    content = _chat_completion(base_url, system_prompt, user_prompt)
+) -> tuple[int, ChatResult]:
+    """Send a single chat completion and return (index, ChatResult)."""
+    result = _chat_completion(base_url, model_name, system_prompt, user_prompt)
     with _print_lock:
-        if content:
-            print(f"  Prompt {index + 1} response received ({len(content)} chars)")
+        if result.content:
+            tps = result.generation_tps
+            print(f"  Prompt {index + 1} response received ({len(result.content)} chars, {result.completion_tokens} tokens, {tps:.1f} tok/s)")
         else:
             print(f"  Prompt {index + 1}: empty/failed response")
-    return index, content
+    return index, result
 
 
 def _batch_chat_completions(
     base_url: str,
+    model_name: str,
     system_prompt: str,
     prompts: list[tuple[int, str]],
-) -> list[tuple[int, str | None]]:
+) -> list[tuple[int, ChatResult]]:
     """Send multiple chat completion requests concurrently.
 
     Args:
         base_url: Server base URL.
+        model_name: Model id from /v1/models.
         system_prompt: Shared system prompt for all requests.
         prompts: List of (original_index, user_prompt) tuples.
 
     Returns:
-        List of (original_index, content) tuples, ordered by completion.
+        List of (original_index, ChatResult) tuples, ordered by index.
     """
-    results: list[tuple[int, str | None]] = [None] * len(prompts)  # type: ignore[assignment]
+    results: list[tuple[int, ChatResult]] = [None] * len(prompts)  # type: ignore[assignment]
 
     with ThreadPoolExecutor(max_workers=len(prompts)) as executor:
         futures = {
             executor.submit(
-                _chat_completion_with_index, base_url, system_prompt, prompt, idx
+                _chat_completion_with_index, base_url, model_name, system_prompt, prompt, idx
             ): idx
             for idx, prompt in prompts
         }
         for future in as_completed(futures):
-            idx, content = future.result()
-            results[idx] = (idx, content)
+            idx, result = future.result()
+            results[idx] = (idx, result)
 
     return results
 
@@ -209,7 +291,7 @@ def enhance_prompt(
     system_prompt: str,
     user_prompt: str,
     extra_flags: str = "",
-) -> str | None:
+) -> ChatResult:
     """Enhance a prompt by spawning a temporary llama-server instance.
 
     1. Find a free port by probing the ephemeral range.
@@ -217,11 +299,11 @@ def enhance_prompt(
     3. Wait for /health to confirm the server is ready.
     4. Send the prompt via /v1/chat/completions.
     5. Kill the server.
-    6. Return the enhanced prompt (or None on failure).
+    6. Return a ChatResult with content and timing stats.
     """
     if not Path(model_path).is_file():
         logger.error("Model file not found: %s", model_path)
-        return None
+        return ChatResult()
 
     port = _find_free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -249,10 +331,10 @@ def enhance_prompt(
     except FileNotFoundError:
         logger.error("llama-server not found at: %s", server_path)
         print(f"  FAILED: llama-server not found at: {server_path}")
-        return None
+        return ChatResult()
     except Exception:
         logger.exception("Failed to start llama-server")
-        return None
+        return ChatResult()
 
     # Wait for /health to confirm the server is fully ready
     print(f"  Waiting for server to start (timeout: {_SERVER_STARTUP_TIMEOUT}s)...")
@@ -268,27 +350,35 @@ def enhance_prompt(
             stderr = server_proc.stderr.read().decode("utf-8", errors="replace") if server_proc.stderr else ""
             logger.error("Server process exited (code=%s). Stderr:\n%s", server_proc.returncode, stderr[-1000:])
         _kill_server(server_proc)
-        return None
+        return ChatResult()
 
     ready_time = time.monotonic()
-    print(f"  Server ready on port {port} in {ready_time - start:.1f}s. Sending prompt...")
+
+    # Discover the loaded model name
+    model_name = _discover_model_name(base_url)
+    logger.info("Discovered model: %s", model_name)
+    print(f"  Server ready on port {port} in {ready_time - start:.1f}s. Model: {model_name}")
 
     # Send the chat completion request
-    result = _chat_completion(base_url, system_prompt, user_prompt)
+    result = _chat_completion(base_url, model_name, system_prompt, user_prompt)
 
     elapsed = time.monotonic() - ready_time
 
     # Always kill the server
     _kill_server(server_proc)
 
-    if result:
-        logger.info("Enhanced prompt (%d chars): %s", len(result), result)
-        print(f"  Result ({len(result)} chars, {elapsed:.1f}s): {result[:200]}{'...' if len(result) > 200 else ''}")
-        return result
+    if result.content:
+        logger.info("Enhanced prompt (%d chars): %s", len(result.content), result.content)
+        print(
+            f"  Result ({len(result.content)} chars, {result.completion_tokens} tokens, "
+            f"{result.generation_tps:.1f} tok/s, {result.total_ms:.0f}ms total, {elapsed:.1f}s wall): "
+            f"{result.content[:200]}{'...' if len(result.content) > 200 else ''}"
+        )
     else:
         logger.warning("Empty or failed response from server")
         print(f"  FAILED: empty or invalid response ({elapsed:.1f}s)")
-        return None
+
+    return result
 
 
 def _kill_server(proc: subprocess.Popen | None):
