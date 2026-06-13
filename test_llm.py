@@ -150,9 +150,9 @@ def test_single(server_path: str, model_path: str, system_prompt: str, user_prom
 
     elapsed = time.monotonic() - start
 
-    if result:
+    if result and result.content:
         print(f"  Success in {elapsed:.1f}s")
-        _print_section("Enhanced prompt", result)
+        _print_section("Enhanced prompt", result.content)
     else:
         print(f"\n  FAILED after {elapsed:.1f}s — check logs above for details.")
 
@@ -218,25 +218,29 @@ def test_batch(
     # Build indexed prompt list
     prompts_to_enhance = list(enumerate(user_prompts))
 
+    # Discover the loaded model name
+    from prompt_enhancer.llm import _discover_model_name
+    model_name = _discover_model_name(base_url)
+
     # Send all prompts concurrently
     print(f"  Sending {len(prompts_to_enhance)} prompt(s) in parallel...")
     start = time.monotonic()
-    results = _batch_chat_completions(base_url, system_prompt, prompts_to_enhance)
+    results = _batch_chat_completions(base_url, model_name, system_prompt, prompts_to_enhance)
     elapsed = time.monotonic() - start
 
     # Kill the server
     _kill_server(server_proc)
 
     # Display results
-    result_map = {idx: content for idx, content in results}
+    result_map = {idx: chat_result for idx, chat_result in results}
     success_count = 0
     for idx, original in enumerate(user_prompts):
-        content = result_map.get(idx)
+        chat_result = result_map.get(idx)
         print(f"\n  --- Prompt {idx + 1} ---")
         print(f"  Input:  {original}")
-        if content:
-            print(f"  Output: {content}")
-            print(f"  ({len(content)} chars)")
+        if chat_result and chat_result.content:
+            print(f"  Output: {chat_result.content}")
+            print(f"  ({len(chat_result.content)} chars, {chat_result.completion_tokens} tokens)")
             success_count += 1
         else:
             print("  Output: (FAILED)")

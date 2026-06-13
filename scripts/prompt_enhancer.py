@@ -9,6 +9,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import gc
+
 import gradio as gr
 import modules.scripts as scripts
 from modules import script_callbacks, shared
@@ -45,6 +47,16 @@ def _log_to_file(msg: str):
     line = f"[{timestamp}] {msg}\n"
     with open(_LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line)
+
+
+def _free_gpu_memory():
+    """Unload all SD models from GPU to free VRAM for llama-server."""
+    from backend import memory_management
+
+    memory_management.unload_all_models()
+    memory_management.soft_empty_cache(force=True)
+    gc.collect()
+    _log_to_file("  GPU memory freed for llama-server")
 
 
 def _dynamic_prompts_installed() -> bool:
@@ -254,6 +266,9 @@ class Script(scripts.Script):
         if not enable:
             _log_to_file("  → disabled, skipping")
             return
+
+        # Free GPU memory before starting llama-server so it has room for its model
+        _free_gpu_memory()
 
         if not preset_name or preset_name == "":
             _log_to_file("  → no preset selected, skipping")
@@ -498,6 +513,13 @@ class Script(scripts.Script):
         p.all_negative_prompts = enhanced_negatives
         _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
         _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
+
+    def postprocess(self, p, processed, enable, *args):
+        """Called after all processing ends. Unload SD models to free VRAM."""
+        if not enable:
+            return
+        _log_to_file("postprocess() — unloading SD models to free VRAM")
+        _free_gpu_memory()
 
 
 # Register settings callback on import
