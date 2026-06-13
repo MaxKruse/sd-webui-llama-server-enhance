@@ -29,7 +29,7 @@ from prompt_enhancer.llm import (
     _kill_server,
     enhance_prompt,
 )
-from prompt_enhancer.presets import load_preset, list_presets
+from prompt_enhancer.presets import AUTO_PRESET, load_preset, list_presets, resolve_preset
 
 logger = logging.getLogger(__name__)
 
@@ -195,9 +195,11 @@ class Script(scripts.Script):
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
-        choices = list_presets()
+        file_choices = list_presets()
+        # "Auto" first, then file-based presets
+        choices = [AUTO_PRESET] + file_choices
         current = shared.opts.llama_enhance_preset
-        value = current if current in choices else (choices[0] if choices else None)
+        value = current if current in choices else AUTO_PRESET
 
         with InputAccordion(
             value=False,
@@ -208,7 +210,7 @@ class Script(scripts.Script):
                 choices=choices,
                 value=value,
                 label="System prompt preset",
-                info="Select a preset from presets/",
+                info="Auto: select preset based on the Forge-Neo UI preset (flux→flux-dev, zit→z-image-turbo, anima→anima)",
                 interactive=True,
                 elem_id=self.elem_id("preset"),
             )
@@ -234,10 +236,11 @@ class Script(scripts.Script):
             )
 
             def on_refresh():
-                choices = list_presets()
+                file_choices = list_presets()
+                choices = [AUTO_PRESET] + file_choices
                 return gr.update(
                     choices=choices,
-                    value=choices[0] if choices else None,
+                    value=AUTO_PRESET,
                 )
 
             refresh_btn.click(
@@ -270,14 +273,24 @@ class Script(scripts.Script):
         # Free GPU memory before starting llama-server so it has room for its model
         _free_gpu_memory()
 
-        if not preset_name or preset_name == "":
-            _log_to_file("  → no preset selected, skipping")
+        # Resolve preset — handle "Auto" selection based on Forge-Neo UI preset
+        forge_preset = getattr(shared.opts, "forge_preset", None)
+        checkpoint_name = getattr(shared.opts, "sd_model_checkpoint", None)
+        resolved = resolve_preset(
+            preset_name,
+            forge_preset=forge_preset,
+            checkpoint_name=checkpoint_name,
+        )
+        _log_to_file(f"  preset={preset_name!r}, forge_preset={forge_preset!r}, checkpoint={checkpoint_name!r} → resolved={resolved!r}")
+
+        if not resolved:
+            _log_to_file("  → no preset resolved, skipping")
             return
 
-        preset_content = load_preset(preset_name)
+        preset_content = load_preset(resolved)
         if not preset_content:
-            logger.warning("Preset '%s' not found, skipping enhancement", preset_name)
-            _log_to_file(f"  → preset '{preset_name}' not found, skipping")
+            logger.warning("Preset '%s' not found, skipping enhancement", resolved)
+            _log_to_file(f"  → preset '{resolved}' not found, skipping")
             return
 
         # Build system prompts (preset + resolution + Dynamic Prompts wildcard note)
