@@ -1,0 +1,13 @@
+# Debug logs
+enhance_debug.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
