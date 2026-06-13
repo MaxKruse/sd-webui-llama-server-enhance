@@ -12,6 +12,7 @@ from pathlib import Path
 import gradio as gr
 import modules.scripts as scripts
 from modules import script_callbacks, shared
+from modules.ui_components import InputAccordion
 from modules.processing import StableDiffusionProcessing
 
 from prompt_enhancer import settings as _settings_module
@@ -49,6 +50,23 @@ def _dynamic_prompts_installed() -> bool:
     return (_EXTENSIONS_DIR / "sd-dynamic-prompts").is_dir()
 
 
+def _build_resolution_instruction(width: int, height: int) -> str:
+    """Build a resolution hint block for the LLM system prompt.
+
+    Tells the LLM the target image dimensions and orientation so it can
+    frame compositions, aspect ratios, and layout descriptions appropriately.
+    """
+    gcd = __import__("math").gcd(width, height)
+    ratio_w, ratio_h = width // gcd, height // gcd
+    orientation = "portrait" if height > width else "landscape" if width > height else "square"
+
+    return (
+        f"\n\n--- Image Resolution ---\n"
+        f"Target resolution: {width}x{height} ({orientation}, {ratio_w}:{ratio_h} aspect ratio)\n"
+        f"Frame your description to suit this orientation."
+    )
+
+
 def _build_dp_wildcard_instruction() -> str:
     """Build a wildcard-preservation instruction for the LLM system prompt.
 
@@ -77,16 +95,25 @@ def _build_dp_wildcard_instruction() -> str:
     )
 
 
-def _effective_system_prompt(preset_content: str) -> str:
-    """Return the preset content with any Dynamic Prompts instruction appended."""
+def _effective_system_prompt(
+    preset_content: str,
+    *,
+    width: int = 0,
+    height: int = 0,
+) -> str:
+    """Return the preset content with optional resolution and DP instructions appended."""
+    result = preset_content
+
+    # Append resolution info if dimensions provided
+    if width > 0 and height > 0:
+        result += _build_resolution_instruction(width, height)
+
+    # Append Dynamic Prompts wildcard preservation note
     dp_instruction = _build_dp_wildcard_instruction()
     if dp_instruction:
-        return preset_content + dp_instruction
-    return preset_content
+        result += dp_instruction
 
-
-def _preset_choices():
-    return ["Disabled"] + list_presets()
+    return result
 
 
 class Script(scripts.Script):
@@ -103,16 +130,20 @@ class Script(scripts.Script):
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
-        choices = _preset_choices()
+        choices = list_presets()
         current = shared.opts.llama_enhance_preset
-        value = current if current in choices else choices[0]
+        value = current if current in choices else (choices[0] if choices else None)
 
-        with gr.Accordion("LLama Server Enhance", open=False):
+        with InputAccordion(
+            value=False,
+            label="LLama Server Enhance",
+            elem_id=self.elem_id("main-accordion"),
+        ) as enable:
             preset_dropdown = gr.Dropdown(
                 choices=choices,
                 value=value,
                 label="System prompt preset",
-                info="Select a preset from presets/ (or Disabled to skip)",
+                info="Select a preset from presets/",
                 interactive=True,
                 elem_id=self.elem_id("preset"),
             )
@@ -131,8 +162,11 @@ class Script(scripts.Script):
             )
 
             def on_refresh():
-                choices = _preset_choices()
-                return gr.update(choices=choices, value=choices[0])
+                choices = list_presets()
+                return gr.update(
+                    choices=choices,
+                    value=choices[0] if choices else None,
+                )
 
             refresh_btn.click(
                 fn=on_refresh,
@@ -140,17 +174,27 @@ class Script(scripts.Script):
                 outputs=[preset_dropdown],
             )
 
-        return [preset_dropdown, enhance_mode]
+        return [enable, preset_dropdown, enhance_mode]
 
-    def process(self, p: StableDiffusionProcessing, preset_name: str, enhance_mode: str):
+    def process(
+        self,
+        p: StableDiffusionProcessing,
+        enable: bool,
+        preset_name: str,
+        enhance_mode: str,
+    ):
         """Called once before any sampling. Enhance prompts here."""
         _log_to_file("=" * 72)
-        _log_to_file(f"process() entered — preset={preset_name!r}, mode={enhance_mode!r}")
+        _log_to_file(f"process() entered — enable={enable!r}, preset={preset_name!r}, mode={enhance_mode!r}")
         _log_to_file(f"  p.all_prompts (input)  = {p.all_prompts!r}")
         _log_to_file(f"  p.n_iter = {p.n_iter}, p.batch_size = {p.batch_size}")
 
-        if preset_name == "Disabled" or preset_name == "":
-            _log_to_file("  → preset Disabled, skipping")
+        if not enable:
+            _log_to_file("  → disabled, skipping")
+            return
+
+        if not preset_name or preset_name == "":
+            _log_to_file("  → no preset selected, skipping")
             return
 
         preset_content = load_preset(preset_name)
@@ -159,8 +203,12 @@ class Script(scripts.Script):
             _log_to_file(f"  → preset '{preset_name}' not found, skipping")
             return
 
-        # Build effective system prompt (preset + Dynamic Prompts wildcard note)
-        system_prompt = _effective_system_prompt(preset_content)
+        # Build effective system prompt (preset + resolution + Dynamic Prompts wildcard note)
+        system_prompt = _effective_system_prompt(
+            preset_content,
+            width=p.width,
+            height=p.height,
+        )
         _log_to_file(f"  system_prompt ({len(system_prompt)} chars): {system_prompt}")
 
         server_path = shared.opts.llama_enhance_server_path or "llama-server"
