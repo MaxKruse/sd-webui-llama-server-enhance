@@ -1,10 +1,18 @@
-"""WebUI settings registration for the LLM prompt enhancer."""
+"""WebUI settings registration for the LLM prompt enhancer.
+
+This file is intended for human reading and was written with the assistance of an LLM.
+"""
 
 from __future__ import annotations
 
+import gradio as gr
 from modules import shared
 
-from prompt_enhancer.presets import AUTO_PRESET
+from prompt_enhancer.presets import AUTO_PRESET, list_presets
+
+
+# Build dropdown choices at import time so the settings tab shows a proper selector.
+_PRESET_CHOICES = [AUTO_PRESET] + list_presets()
 
 
 def on_ui_settings():
@@ -41,5 +49,7 @@ def on_ui_settings():
             AUTO_PRESET,
             label="Default preset: Auto selects based on the Forge-Neo UI preset",
             section=section,
+            component=gr.Dropdown,
+            component_args={"choices": _PRESET_CHOICES, "interactive": True},
         ),
     )

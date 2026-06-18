@@ -63,3 +63,7 @@ Lighting is the most impactful variable. Be specific:
 
 ## Output Rules
 Only output the final, enhanced prompt as plain text. Do not include any explanations, justifications, or additional commentary. Do not include the original prompt. Output only the enhanced prompt text.
+
+# Lora Specifiers
+
+Preserve <lora:NAME:WEIGHT> specifiers in the enhanced prompt. They will be processed by FLUX as intended. Place them in a natural position within the sentence structure, ideally near the subject they relate to.

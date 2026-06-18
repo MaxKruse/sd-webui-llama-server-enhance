@@ -1,4 +1,7 @@
-"""AlwaysVisible script that enhances prompts via llama-server."""
+"""AlwaysVisible script that enhances prompts via llama-server.
+
+This file was modified with the assistance of an LLM.
+"""
 
 from __future__ import annotations
 
@@ -25,6 +28,7 @@ from prompt_enhancer.llm import (
     _discover_model_name,
     _find_free_port,
     _wait_for_server,
+    _warmup_chat_endpoint,
     _batch_chat_completions,
     _kill_server,
     enhance_prompt,
@@ -249,6 +253,13 @@ class Script(scripts.Script):
                 outputs=[preset_dropdown],
             )
 
+            # Persist dropdown selection back to settings so it survives page reloads
+            preset_dropdown.change(
+                fn=lambda chosen: (shared.opts.set("llama_enhance_preset", chosen), shared.opts.save()),
+                inputs=[preset_dropdown],
+                outputs=[],
+            )
+
         return [enable, preset_dropdown, enhance_mode, enhance_negative]
 
     def process(
@@ -457,6 +468,11 @@ class Script(scripts.Script):
         print(f"  Server ready on port {port} in {ready_time - start:.1f}s. Model: {model_name}")
         _log_to_file(f"  Server ready in {ready_time - start:.1f}s")
 
+        # Warm up the chat endpoint — /health returns 200 before parallel slots
+        # are initialized, causing HTTP 400 on the first real request.
+        # Warm up as many slots as we have prompts to ensure each slot is ready.
+        _warmup_chat_endpoint(base_url, model_name, num_slots=len(prompts_to_enhance))
+
         # --- Step 1: Batch enhance positive prompts ---
         print(f"  Sending {len(prompts_to_enhance)} positive prompt(s) in parallel...")
         pos_results = _batch_chat_completions(base_url, model_name, system_prompt, prompts_to_enhance)
@@ -483,9 +499,10 @@ class Script(scripts.Script):
                 enhanced_prompts[idx] = result.content
                 successful_indices.append(idx)
             else:
-                _log_to_file(f"  → prompt {idx}: positive enhancement failed, keeping original")
-                logger.info("Prompt %d: using original (enhancement failed)", idx + 1)
-                print(f"  Prompt {idx + 1}: using original (enhancement failed)")
+                error_detail = result.error if result and result.error else "no result"
+                _log_to_file(f"  → prompt {idx}: positive enhancement failed ({error_detail}), keeping original")
+                logger.info("Prompt %d: using original (enhancement failed: %s)", idx + 1, error_detail)
+                print(f"  Prompt {idx + 1}: using original (enhancement failed: {error_detail})")
                 enhanced_prompts[idx] = original
 
         # --- Step 2: Batch enhance negative prompts (if enabled) ---
@@ -519,8 +536,16 @@ class Script(scripts.Script):
                     enhanced_negatives[idx] = result.content
                 # else: keep original negative (already set as baseline)
 
-        # Kill the server
+        # Kill the server and capture stderr for diagnostics
         _kill_server(server_proc)
+        if server_proc and server_proc.stderr:
+            try:
+                stderr_output = server_proc.stderr.read().decode("utf-8", errors="replace")
+                stderr_tail = stderr_output[-3000:]
+                if stderr_tail.strip():
+                    _log_to_file(f"  llama-server stderr (last 3000 chars):\n{stderr_tail}")
+            except Exception:
+                pass
 
         p.all_prompts = enhanced_prompts
         p.all_negative_prompts = enhanced_negatives

@@ -17,10 +17,12 @@ import socket
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
 from urllib import request, error
+
+import aiohttp
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +118,7 @@ _print_lock = Lock()
 
 class ChatResult:
     """Result from a single chat completion, including timing stats."""
-    __slots__ = ("content", "prompt_tokens", "completion_tokens", "prompt_ms", "predicted_ms")
+    __slots__ = ("content", "prompt_tokens", "completion_tokens", "prompt_ms", "predicted_ms", "error")
 
     def __init__(
         self,
@@ -126,12 +128,14 @@ class ChatResult:
         completion_tokens: int = 0,
         prompt_ms: float = 0.0,
         predicted_ms: float = 0.0,
+        error: str | None = None,
     ):
         self.content = content
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.prompt_ms = prompt_ms
         self.predicted_ms = predicted_ms
+        self.error = error
 
     @property
     def prompt_tps(self) -> float:
@@ -157,6 +161,8 @@ def _discover_model_name(base_url: str) -> str:
 
     Prefers the model whose status is "loaded". Falls back to the first
     model in the list, then to "llama" if nothing is available.
+    Strips trailing .gguf extension — some llama-server builds reject
+    model names that include the file extension in chat completions.
     """
     try:
         with request.urlopen(f"{base_url}/v1/models", timeout=_HTTP_TIMEOUT) as resp:
@@ -166,13 +172,77 @@ def _discover_model_name(base_url: str) -> str:
             for m in models:
                 status = m.get("status", {})
                 if isinstance(status, dict) and status.get("value") == "loaded":
-                    return m.get("id", "llama")
+                    name = m.get("id", "llama")
+                    return name[:-5] if name.lower().endswith(".gguf") else name
             # Fallback: first model
             if models:
-                return models[0].get("id", "llama")
+                name = models[0].get("id", "llama")
+                return name[:-5] if name.lower().endswith(".gguf") else name
     except (error.URLError, json.JSONDecodeError, KeyError):
         pass
     return "llama"
+
+
+def _warmup_chat_endpoint(base_url: str, model_name: str, num_slots: int = 2):
+    """Send minimal chat completions to warm up the chat handler and parallel slots.
+
+    With --no-warmup + --parallel N, /health returns 200 before the chat
+    endpoint is fully ready. The first real request can get HTTP 400.
+    This sends tiny requests (1 token each) sequentially to ensure multiple
+    slots are initialized — critical when --no-kv-unified is used because
+    each slot has its own KV cache.
+    """
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+
+    deadline = time.monotonic() + 30  # 30s max total for warmup
+    for slot_num in range(num_slots):
+        slot_start = time.monotonic()
+        if slot_start > deadline:
+            logger.warning("Warmup deadline exceeded before slot %d — proceeding", slot_num)
+            break
+
+        slot_ok = False
+        while time.monotonic() < deadline:
+            req = request.Request(
+                f"{base_url}/v1/chat/completions",
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer no-key",
+                },
+                method="POST",
+            )
+            try:
+                with request.urlopen(req, timeout=15) as resp:
+                    resp.read()  # consume response
+                    logger.info("Chat endpoint warmup slot %d successful", slot_num)
+                    slot_ok = True
+                    break
+            except error.HTTPError as exc:
+                try:
+                    body = exc.read().decode("utf-8", errors="replace")
+                except Exception:
+                    body = ""
+                logger.warning(
+                    "Warmup slot %d got HTTP %s — retrying (%s)",
+                    slot_num,
+                    exc.code,
+                    body[:200],
+                )
+                time.sleep(1)
+            except (error.URLError, OSError):
+                time.sleep(0.5)
+
+        if not slot_ok:
+            logger.warning("Warmup slot %d did not succeed — proceeding anyway", slot_num)
+
+    logger.info("Chat endpoint warmup complete (warmed %d slot(s))", num_slots)
 
 
 def _chat_completion(
@@ -229,27 +299,87 @@ def _chat_completion(
                 prompt_ms=prompt_ms,
                 predicted_ms=predicted_ms,
             )
+    except error.HTTPError as exc:
+        # Capture the server's error response body for debugging
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = "<unreadable>"
+        error_msg = f"HTTP {exc.code}: {body[:500]}"
+        logger.error("Chat completion request failed: %s", error_msg)
+        print(f"  Chat completion request failed: HTTP {exc.code}: {body[:200]}")
+        return ChatResult(error=error_msg)
     except (error.URLError, json.JSONDecodeError, KeyError, IndexError) as exc:
-        logger.error("Chat completion request failed: %s", exc)
-        return ChatResult()
+        error_msg = f"{type(exc).__name__}: {exc}"
+        logger.error("Chat completion request failed: %s", error_msg)
+        print(f"  Chat completion request failed: {error_msg}")
+        return ChatResult(error=error_msg)
 
 
-def _chat_completion_with_index(
+async def _chat_completion_async(
+    session: aiohttp.ClientSession,
     base_url: str,
     model_name: str,
     system_prompt: str,
     user_prompt: str,
     index: int,
 ) -> tuple[int, ChatResult]:
-    """Send a single chat completion and return (index, ChatResult)."""
-    result = _chat_completion(base_url, model_name, system_prompt, user_prompt)
+    """Send a single chat completion request via aiohttp and return (index, ChatResult)."""
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    try:
+        async with session.post(
+            f"{base_url}/v1/chat/completions",
+            json=payload,
+            headers={"Authorization": "Bearer no-key"},
+            timeout=aiohttp.ClientTimeout(total=120),
+        ) as resp:
+            result = await resp.json(content_type=None)
+            content = result["choices"][0]["message"]["content"]
+
+            usage = result.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", usage.get("prompt_n", 0))
+            completion_tokens = usage.get("completion_tokens", usage.get("predicted_n", 0))
+
+            timings = result.get("timings", {})
+            prompt_ms = timings.get("prompt_ms", 0)
+            predicted_ms = timings.get("predicted_ms", 0)
+
+            chat_result = ChatResult(
+                content=content.strip() if content else None,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                prompt_ms=prompt_ms,
+                predicted_ms=predicted_ms,
+            )
+    except aiohttp.ClientResponseError as exc:
+        error_msg = f"HTTP {exc.status}: {exc.message}"
+        logger.error("Chat completion request failed: %s", error_msg)
+        with _print_lock:
+            print(f"  Chat completion request failed: {error_msg}")
+        chat_result = ChatResult(error=error_msg)
+    except Exception as exc:
+        error_msg = f"{type(exc).__name__}: {exc}"
+        logger.error("Chat completion request failed: %s", error_msg)
+        with _print_lock:
+            print(f"  Chat completion request failed: {error_msg}")
+        chat_result = ChatResult(error=error_msg)
+
     with _print_lock:
-        if result.content:
-            tps = result.generation_tps
-            print(f"  Prompt {index + 1} response received ({len(result.content)} chars, {result.completion_tokens} tokens, {tps:.1f} tok/s)")
+        if chat_result.content:
+            tps = chat_result.generation_tps
+            print(f"  Prompt {index + 1} response received ({len(chat_result.content)} chars, {chat_result.completion_tokens} tokens, {tps:.1f} tok/s)")
         else:
-            print(f"  Prompt {index + 1}: empty/failed response")
-    return index, result
+            reason = chat_result.error if chat_result.error else "unknown"
+            print(f"  Prompt {index + 1}: empty/failed response ({reason})")
+
+    return index, chat_result
 
 
 def _batch_chat_completions(
@@ -258,7 +388,9 @@ def _batch_chat_completions(
     system_prompt: str,
     prompts: list[tuple[int, str]],
 ) -> list[tuple[int, ChatResult]]:
-    """Send multiple chat completion requests concurrently.
+    """Send multiple chat completion requests concurrently using aiohttp.
+
+    Uses asyncio + aiohttp for true concurrent HTTP I/O (no GIL blocking).
 
     Args:
         base_url: Server base URL.
@@ -269,20 +401,16 @@ def _batch_chat_completions(
     Returns:
         List of (original_index, ChatResult) tuples, ordered by index.
     """
-    results: list[tuple[int, ChatResult]] = [None] * len(prompts)  # type: ignore[assignment]
+    async def _run() -> list[tuple[int, ChatResult]]:
+        connector = aiohttp.TCPConnector(limit=len(prompts), force_close=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            tasks = [
+                _chat_completion_async(session, base_url, model_name, system_prompt, prompt, idx)
+                for idx, prompt in prompts
+            ]
+            return await asyncio.gather(*tasks)
 
-    with ThreadPoolExecutor(max_workers=len(prompts)) as executor:
-        futures = {
-            executor.submit(
-                _chat_completion_with_index, base_url, model_name, system_prompt, prompt, idx
-            ): idx
-            for idx, prompt in prompts
-        }
-        for future in as_completed(futures):
-            idx, result = future.result()
-            results[idx] = (idx, result)
-
-    return results
+    return asyncio.run(_run())
 
 
 def enhance_prompt(
@@ -359,6 +487,11 @@ def enhance_prompt(
     logger.info("Discovered model: %s", model_name)
     print(f"  Server ready on port {port} in {ready_time - start:.1f}s. Model: {model_name}")
 
+    # Warm up the chat endpoint — /health returns 200 before the chat handler
+    # and parallel KV slots are fully initialized. Without this, the first real
+    # request can get HTTP 400 (especially with --parallel N --no-kv-unified).
+    _warmup_chat_endpoint(base_url, model_name, num_slots=1)
+
     # Send the chat completion request
     result = _chat_completion(base_url, model_name, system_prompt, user_prompt)
 
@@ -377,6 +510,14 @@ def enhance_prompt(
     else:
         logger.warning("Empty or failed response from server")
         print(f"  FAILED: empty or invalid response ({elapsed:.1f}s)")
+        # Capture server stderr for diagnostics
+        if server_proc and server_proc.stderr:
+            try:
+                stderr_output = server_proc.stderr.read().decode("utf-8", errors="replace")
+                if stderr_output.strip():
+                    logger.warning("Server stderr:\n%s", stderr_output[-2000:])
+            except Exception:
+                pass
 
     return result
 
