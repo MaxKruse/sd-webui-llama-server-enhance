@@ -161,9 +161,16 @@ def _discover_model_name(base_url: str) -> str:
 
     Prefers the model whose status is "loaded". Falls back to the first
     model in the list, then to "llama" if nothing is available.
-    Strips trailing .gguf extension — some llama-server builds reject
-    model names that include the file extension in chat completions.
+    Strips trailing .gguf extension and full filesystem paths — some
+    llama-server builds reject model names that include the extension
+    or the full path in chat completions.
     """
+    def _clean_name(raw: str) -> str:
+        """Strip .gguf extension and filesystem path, returning just the model filename."""
+        p = Path(raw)
+        name = p.stem  # strips .gguf if present
+        return name or "llama"
+
     try:
         with request.urlopen(f"{base_url}/v1/models", timeout=_HTTP_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8"))
@@ -172,12 +179,10 @@ def _discover_model_name(base_url: str) -> str:
             for m in models:
                 status = m.get("status", {})
                 if isinstance(status, dict) and status.get("value") == "loaded":
-                    name = m.get("id", "llama")
-                    return name[:-5] if name.lower().endswith(".gguf") else name
+                    return _clean_name(m.get("id", "llama"))
             # Fallback: first model
             if models:
-                name = models[0].get("id", "llama")
-                return name[:-5] if name.lower().endswith(".gguf") else name
+                return _clean_name(models[0].get("id", "llama"))
     except (error.URLError, json.JSONDecodeError, KeyError):
         pass
     return "llama"
