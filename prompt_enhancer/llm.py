@@ -32,6 +32,9 @@ _SERVER_STARTUP_TIMEOUT = 60
 # Timeout for individual HTTP requests.
 _HTTP_TIMEOUT = 5
 
+# Max retries for chat completion requests (transient server errors).
+_MAX_CHAT_RETRIES = 5
+
 # Port range to probe for a free port.
 _PORT_RANGE = range(49152, 65536)
 
@@ -262,6 +265,9 @@ def _chat_completion(
     The server automatically strips reasoning_content from content.
     Inference params (max_tokens, temperature, top_p) are omitted so the
     server uses its own defaults.
+
+    Retries up to _MAX_CHAT_RETRIES times on transient errors (HTTP failures,
+    malformed responses, missing choices).
     """
     payload = {
         "model": model_name,
@@ -271,54 +277,68 @@ def _chat_completion(
         ],
     }
 
-    data = json.dumps(payload).encode("utf-8")
-    req = request.Request(
-        f"{base_url}/v1/chat/completions",
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": "Bearer no-key",
-        },
-        method="POST",
-    )
+    last_error: str | None = None
+    for attempt in range(1, _MAX_CHAT_RETRIES + 1):
+        data = json.dumps(payload).encode("utf-8")
+        req = request.Request(
+            f"{base_url}/v1/chat/completions",
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer no-key",
+            },
+            method="POST",
+        )
 
-    try:
-        with request.urlopen(req, timeout=120) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-            content = result["choices"][0]["message"]["content"]
-
-            # Extract token counts from usage
-            usage = result.get("usage", {})
-            prompt_tokens = usage.get("prompt_tokens", usage.get("prompt_n", 0))
-            completion_tokens = usage.get("completion_tokens", usage.get("predicted_n", 0))
-
-            # Extract timing from the timings block (llama-server)
-            timings = result.get("timings", {})
-            prompt_ms = timings.get("prompt_ms", 0)
-            predicted_ms = timings.get("predicted_ms", 0)
-
-            return ChatResult(
-                content=content.strip() if content else None,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                prompt_ms=prompt_ms,
-                predicted_ms=predicted_ms,
-            )
-    except error.HTTPError as exc:
-        # Capture the server's error response body for debugging
         try:
-            body = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            body = "<unreadable>"
-        error_msg = f"HTTP {exc.code}: {body[:500]}"
-        logger.error("Chat completion request failed: %s", error_msg)
-        print(f"  Chat completion request failed: HTTP {exc.code}: {body[:200]}")
-        return ChatResult(error=error_msg)
-    except (error.URLError, json.JSONDecodeError, KeyError, IndexError) as exc:
-        error_msg = f"{type(exc).__name__}: {exc}"
-        logger.error("Chat completion request failed: %s", error_msg)
-        print(f"  Chat completion request failed: {error_msg}")
-        return ChatResult(error=error_msg)
+            with request.urlopen(req, timeout=120) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+                content = result["choices"][0]["message"]["content"]
+
+                # Extract token counts from usage
+                usage = result.get("usage", {})
+                prompt_tokens = usage.get("prompt_tokens", usage.get("prompt_n", 0))
+                completion_tokens = usage.get("completion_tokens", usage.get("predicted_n", 0))
+
+                # Extract timing from the timings block (llama-server)
+                timings = result.get("timings", {})
+                prompt_ms = timings.get("prompt_ms", 0)
+                predicted_ms = timings.get("predicted_ms", 0)
+
+                return ChatResult(
+                    content=content.strip() if content else None,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    prompt_ms=prompt_ms,
+                    predicted_ms=predicted_ms,
+                )
+        except error.HTTPError as exc:
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = "<unreadable>"
+            last_error = f"HTTP {exc.code}: {body[:500]}"
+            logger.error("Chat completion request failed (attempt %d/%d): %s", attempt, _MAX_CHAT_RETRIES, last_error)
+            print(f"  Chat completion request failed (attempt {attempt}/{_MAX_CHAT_RETRIES}): HTTP {exc.code}: {body[:200]}")
+        except (error.URLError, json.JSONDecodeError, KeyError, IndexError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            logger.error("Chat completion request failed (attempt %d/%d): %s", attempt, _MAX_CHAT_RETRIES, last_error)
+            print(f"  Chat completion request failed (attempt {attempt}/{_MAX_CHAT_RETRIES}): {last_error}")
+
+        # Retry with exponential backoff (skip sleep on last attempt).
+        # Requests can take 16–30 s, so we need wide spacing so later
+        # attempts land after the first batch frees its slots.
+        if attempt < _MAX_CHAT_RETRIES:
+            backoff = min(3 * (2 ** (attempt - 1)), 30)  # 3s, 6s, 12s, 24s (capped 30s)
+            logger.info("Retrying in %.1fs...", backoff)
+            print(f"  Retrying in {backoff:.0f}s...")
+            time.sleep(backoff)
+
+    # All retries exhausted
+    error_msg = last_error or "all retries failed"
+    logger.error("Chat completion request failed after %d retries: %s", _MAX_CHAT_RETRIES, error_msg)
+    print(f"  Chat completion request failed after {_MAX_CHAT_RETRIES} retries: {error_msg}")
+    return ChatResult(error=error_msg)
 
 
 async def _chat_completion_async(
@@ -329,7 +349,11 @@ async def _chat_completion_async(
     user_prompt: str,
     index: int,
 ) -> tuple[int, ChatResult]:
-    """Send a single chat completion request via aiohttp and return (index, ChatResult)."""
+    """Send a single chat completion request via aiohttp and return (index, ChatResult).
+
+    Retries up to _MAX_CHAT_RETRIES times on transient errors (HTTP failures,
+    malformed responses, missing choices).
+    """
     payload = {
         "model": model_name,
         "messages": [
@@ -338,50 +362,65 @@ async def _chat_completion_async(
         ],
     }
 
-    try:
-        async with session.post(
-            f"{base_url}/v1/chat/completions",
-            json=payload,
-            headers={"Authorization": "Bearer no-key"},
-            timeout=aiohttp.ClientTimeout(total=120),
-        ) as resp:
-            result = await resp.json(content_type=None)
-            content = result["choices"][0]["message"]["content"]
+    last_error: str | None = None
+    chat_result = ChatResult()
 
-            usage = result.get("usage", {})
-            prompt_tokens = usage.get("prompt_tokens", usage.get("prompt_n", 0))
-            completion_tokens = usage.get("completion_tokens", usage.get("predicted_n", 0))
+    for attempt in range(1, _MAX_CHAT_RETRIES + 1):
+        try:
+            async with session.post(
+                f"{base_url}/v1/chat/completions",
+                json=payload,
+                headers={"Authorization": "Bearer no-key"},
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                result = await resp.json(content_type=None)
+                content = result["choices"][0]["message"]["content"]
 
-            timings = result.get("timings", {})
-            prompt_ms = timings.get("prompt_ms", 0)
-            predicted_ms = timings.get("predicted_ms", 0)
+                usage = result.get("usage", {})
+                prompt_tokens = usage.get("prompt_tokens", usage.get("prompt_n", 0))
+                completion_tokens = usage.get("completion_tokens", usage.get("predicted_n", 0))
 
-            chat_result = ChatResult(
-                content=content.strip() if content else None,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                prompt_ms=prompt_ms,
-                predicted_ms=predicted_ms,
-            )
-    except aiohttp.ClientResponseError as exc:
-        error_msg = f"HTTP {exc.status}: {exc.message}"
-        logger.error("Chat completion request failed: %s", error_msg)
-        with _print_lock:
-            print(f"  Chat completion request failed: {error_msg}")
-        chat_result = ChatResult(error=error_msg)
-    except Exception as exc:
-        error_msg = f"{type(exc).__name__}: {exc}"
-        logger.error("Chat completion request failed: %s", error_msg)
-        with _print_lock:
-            print(f"  Chat completion request failed: {error_msg}")
-        chat_result = ChatResult(error=error_msg)
+                timings = result.get("timings", {})
+                prompt_ms = timings.get("prompt_ms", 0)
+                predicted_ms = timings.get("predicted_ms", 0)
 
+                chat_result = ChatResult(
+                    content=content.strip() if content else None,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    prompt_ms=prompt_ms,
+                    predicted_ms=predicted_ms,
+                )
+                break  # Success
+
+        except aiohttp.ClientResponseError as exc:
+            last_error = f"HTTP {exc.status}: {exc.message}"
+            logger.error("Chat completion request failed (attempt %d/%d): %s", attempt, _MAX_CHAT_RETRIES, last_error)
+            with _print_lock:
+                print(f"  Chat completion request failed (attempt {attempt}/{_MAX_CHAT_RETRIES}): {last_error}")
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            logger.error("Chat completion request failed (attempt %d/%d): %s", attempt, _MAX_CHAT_RETRIES, last_error)
+            with _print_lock:
+                print(f"  Chat completion request failed (attempt {attempt}/{_MAX_CHAT_RETRIES}): {last_error}")
+
+        # Retry with exponential backoff (skip sleep on last attempt).
+        # Requests can take 16–30 s, so we need wide spacing so later
+        # attempts land after the first batch frees its slots.
+        if attempt < _MAX_CHAT_RETRIES:
+            backoff = min(3 * (2 ** (attempt - 1)), 30)  # 3s, 6s, 12s, 24s (capped 30s)
+            logger.info("Retrying in %.1fs...", backoff)
+            with _print_lock:
+                print(f"  Retrying in {backoff:.0f}s...")
+            await asyncio.sleep(backoff)
+
+    # Final status print
     with _print_lock:
         if chat_result.content:
             tps = chat_result.generation_tps
             print(f"  Prompt {index + 1} response received ({len(chat_result.content)} chars, {chat_result.completion_tokens} tokens, {tps:.1f} tok/s)")
         else:
-            reason = chat_result.error if chat_result.error else "unknown"
+            reason = last_error or "unknown"
             print(f"  Prompt {index + 1}: empty/failed response ({reason})")
 
     return index, chat_result
