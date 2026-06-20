@@ -191,6 +191,28 @@ def _discover_model_name(base_url: str) -> str:
     return "llama"
 
 
+def _discover_slot_count(base_url: str, model_name: str) -> int:
+    """Query /slots to determine how many parallel slots the server has.
+
+    Returns the number of slots (parallelism). Falls back to 1 if the
+    endpoint is unavailable or returns an error.
+    """
+    try:
+        with request.urlopen(
+            f"{base_url}/slots?model={model_name}",
+            timeout=_HTTP_TIMEOUT,
+        ) as resp:
+            slots = json.loads(resp.read().decode("utf-8"))
+            if isinstance(slots, list):
+                count = len(slots)
+                logger.info("Discovered %d slot(s) from /slots", count)
+                return max(count, 1)
+    except (error.URLError, error.HTTPError, json.JSONDecodeError, OSError):
+        pass
+    logger.info("/slots unavailable, defaulting to 1 slot")
+    return 1
+
+
 def _warmup_chat_endpoint(base_url: str, model_name: str, num_slots: int = 2):
     """Send minimal chat completions to warm up the chat handler and parallel slots.
 
@@ -431,27 +453,39 @@ def _batch_chat_completions(
     model_name: str,
     system_prompt: str,
     prompts: list[tuple[int, str]],
+    *,
+    max_concurrent: int | None = None,
 ) -> list[tuple[int, ChatResult]]:
     """Send multiple chat completion requests concurrently using aiohttp.
 
     Uses asyncio + aiohttp for true concurrent HTTP I/O (no GIL blocking).
+    Limits concurrent in-flight requests to max_concurrent (default: server slot count).
 
     Args:
         base_url: Server base URL.
         model_name: Model id from /v1/models.
         system_prompt: Shared system prompt for all requests.
         prompts: List of (original_index, user_prompt) tuples.
+        max_concurrent: Max simultaneous requests. Defaults to len(prompts).
 
     Returns:
         List of (original_index, ChatResult) tuples, ordered by index.
     """
+    if max_concurrent is None:
+        max_concurrent = len(prompts)
+
     async def _run() -> list[tuple[int, ChatResult]]:
-        connector = aiohttp.TCPConnector(limit=len(prompts), force_close=False)
+        semaphore = asyncio.Semaphore(max_concurrent)
+        connector = aiohttp.TCPConnector(limit=max_concurrent, force_close=False)
+
+        async def _semapped(idx: int, prompt: str) -> tuple[int, ChatResult]:
+            async with semaphore:
+                return await _chat_completion_async(
+                    session, base_url, model_name, system_prompt, prompt, idx
+                )
+
         async with aiohttp.ClientSession(connector=connector) as session:
-            tasks = [
-                _chat_completion_async(session, base_url, model_name, system_prompt, prompt, idx)
-                for idx, prompt in prompts
-            ]
+            tasks = [_semapped(idx, prompt) for idx, prompt in prompts]
             return await asyncio.gather(*tasks)
 
     return asyncio.run(_run())

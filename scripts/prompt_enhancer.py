@@ -26,6 +26,7 @@ from prompt_enhancer.llm import (
     _SERVER_STARTUP_TIMEOUT,
     _build_command,
     _discover_model_name,
+    _discover_slot_count,
     _find_free_port,
     _wait_for_server,
     _warmup_chat_endpoint,
@@ -465,17 +466,31 @@ class Script(scripts.Script):
         # Discover the loaded model name
         model_name = _discover_model_name(base_url)
         _log_to_file(f"  Discovered model: {model_name}")
-        print(f"  Server ready on port {port} in {ready_time - start:.1f}s. Model: {model_name}")
+
+        # Discover how many parallel slots the server has
+        slot_count = _discover_slot_count(base_url, model_name)
+        _log_to_file(f"  Discovered {slot_count} slot(s)")
+
+        print(
+            f"  Server ready on port {port} in {ready_time - start:.1f}s. "
+            f"Model: {model_name}, Slots: {slot_count}"
+        )
         _log_to_file(f"  Server ready in {ready_time - start:.1f}s")
 
         # Warm up the chat endpoint — /health returns 200 before parallel slots
         # are initialized, causing HTTP 400 on the first real request.
-        # Warm up as many slots as we have prompts to ensure each slot is ready.
-        _warmup_chat_endpoint(base_url, model_name, num_slots=len(prompts_to_enhance))
+        # Warm up exactly as many slots as the server has.
+        _warmup_chat_endpoint(base_url, model_name, num_slots=slot_count)
 
         # --- Step 1: Batch enhance positive prompts ---
-        print(f"  Sending {len(prompts_to_enhance)} positive prompt(s) in parallel...")
-        pos_results = _batch_chat_completions(base_url, model_name, system_prompt, prompts_to_enhance)
+        print(
+            f"  Sending {len(prompts_to_enhance)} positive prompt(s) "
+            f"({slot_count} concurrent) ..."
+        )
+        pos_results = _batch_chat_completions(
+            base_url, model_name, system_prompt, prompts_to_enhance,
+            max_concurrent=slot_count,
+        )
         pos_result_map: dict[int, ChatResult] = {idx: result for idx, result in pos_results}
 
         # Build enhanced positive list + track which indices succeeded
@@ -518,8 +533,14 @@ class Script(scripts.Script):
                 neg_user_prompt = _build_negative_user_prompt(enhanced_prompts[idx], original_negative)
                 neg_prompts.append((idx, neg_user_prompt))
 
-            print(f"  Sending {len(neg_prompts)} negative prompt(s) in parallel...")
-            neg_results = _batch_chat_completions(base_url, model_name, negative_system_prompt, neg_prompts)
+            print(
+                f"  Sending {len(neg_prompts)} negative prompt(s) "
+                f"({slot_count} concurrent) ..."
+            )
+            neg_results = _batch_chat_completions(
+                base_url, model_name, negative_system_prompt, neg_prompts,
+                max_concurrent=slot_count,
+            )
             neg_result_map: dict[int, ChatResult] = {idx: result for idx, result in neg_results}
 
             for idx in successful_indices:
