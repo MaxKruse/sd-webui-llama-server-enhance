@@ -2,17 +2,18 @@
 
 LLM-powered prompt enhancement for **Stable Diffusion WebUI Forge**, using [llama.cpp](https://github.com/ggerganov/llama.cpp)'s `llama-server` HTTP API.
 
-Drop this extension into your `extensions/` folder and get per-image prompt enhancement powered by any local GGUF model — no cloud API keys needed.
+Drop this extension into your `extensions/` folder and get per-image prompt enhancement powered by any local GGUF model - no cloud API keys needed.
 
 ## Features
 
-- **Batch mode** — starts a single `llama-server` instance and sends all prompts in parallel, eliminating per-image startup penalties
-- **Preset system** — load system prompts from `presets/*.txt` files
-- **Dynamic Prompts integration** — automatically preserves `__wildcard__` and `{variant|syntax}` tokens when the sd-dynamic-prompts extension is installed
+- **Batch mode** - starts a single `llama-server` instance and sends all prompts in parallel, eliminating per-image startup penalties
+- **Auto preset selection** - automatically selects the correct system prompt preset based on the Forge-Neo UI preset (flux, zit, anima)
+- **Hires fix aware** - provides the LLM with final output dimensions (after hires fix upscaling) so it can frame compositions appropriately
+- **Dynamic Prompts integration** - automatically preserves `__wildcard__` and `{variant|syntax}` tokens when the sd-dynamic-prompts extension is installed
 - **Two enhancement modes**:
-  - **Per image** — enhance each prompt individually (batch-optimized: one server, parallel requests)
-  - **Once** — enhance one prompt and apply it to all images in the batch
-- **OpenAI-compatible API** — works with any model that `llama-server` can load
+  - **Per image** - enhance each prompt individually (batch-optimized: one server, parallel requests)
+  - **Once** - enhance one prompt and apply it to all images in the batch
+- **OpenAI-compatible API** - works with any model that `llama-server` can load
 
 ## Installation
 
@@ -24,13 +25,13 @@ Drop this extension into your `extensions/` folder and get per-image prompt enha
 
 2. Ensure `llama-server` is available in your `PATH` or set the full path in WebUI settings.
 
-3. Set your model path in **Settings → LLama Server Enhance**.
+3. Set your model path in **Settings -> LLama Server Enhance**.
 
 4. Restart WebUI Forge.
 
 ## Configuration
 
-All settings are in **Settings → LLama Server Enhance**:
+All settings are in **Settings -> LLama Server Enhance**:
 
 | Setting | Description |
 |---------|-------------|
@@ -40,9 +41,22 @@ All settings are in **Settings → LLama Server Enhance**:
 
 ## Presets
 
-Create `.txt` files in the `presets/` directory. Each file becomes a selectable preset in the UI. The file content is used as the system prompt sent to the LLM.
+Create `.txt` files in the `presets/` directory. Each file becomes an auto-selectable preset. The file content is used as the system prompt sent to the LLM.
 
-A preset for the [Anima](https://github.com/CircleStone-Labs/Anima) anime model is included (`presets/anima.txt`).
+The preset is automatically selected based on the Forge-Neo UI preset:
+
+| Forge-Neo Preset | LLM Preset |
+|------------------|------------|
+| `flux` | `flux-dev` |
+| `flux` (with "krea" checkpoint) | `flux-krea-dev` |
+| `zit` | `z-image-turbo` |
+| `anima` | `anima` |
+
+Included presets:
+- `presets/anima.txt` - for the [Anima](https://github.com/CircleStone-Labs/Anima) anime model
+- `presets/flux-dev.txt` - for FLUX.1 [dev]
+- `presets/flux-krea-dev.txt` - for FLUX.1 Krea [dev]
+- `presets/z-image-turbo.txt` - for Z-Image Turbo
 
 ## Enhancement Modes
 
@@ -54,11 +68,21 @@ Each prompt in the batch is enhanced individually. The extension starts **one** 
 
 Enhances only the first prompt and applies the result to all images in the batch. Useful for grid generation or when you want consistent enhancement across all outputs.
 
+## Resolution Awareness
+
+The extension automatically detects hires fix settings and provides the LLM with:
+
+- **Final output resolution** - the dimensions after hires fix upscaling (or base dimensions if no hires fix)
+- **Orientation and aspect ratio** - portrait, landscape, or square
+- **Base resolution** - when hires fix is enabled, the LLM also knows the initial generation dimensions
+
+This allows the LLM to frame compositions, describe layouts, and choose appropriate camera angles for the final output size.
+
 ## How It Works
 
 ### Single prompt (Once mode)
 
-1. Find a free TCP port in the ephemeral range (49152–65535)
+1. Find a free TCP port in the ephemeral range (49152-65535)
 2. Start `llama-server` on that port with `--no-ui --no-warmup`
 3. Poll `/health` until the model is loaded and ready (60s timeout)
 4. Send the prompt via `/v1/chat/completions`
@@ -73,20 +97,20 @@ Enhances only the first prompt and applies the result to all images in the batch
 5. Collect all responses
 6. Kill the server
 
-This avoids the N×startup penalty of spawning a new server per prompt.
+This avoids the Nxstartup penalty of spawning a new server per prompt.
 
 ## Test Script
 
 A standalone test script is included for validating your setup:
 
 ```bash
-# Dry run — see the command that would be built
+# Dry run - see the command that would be built
 python test_llm.py --preset anima --model C:/models/my-model.gguf --dry-run
 
 # Single prompt test
 python test_llm.py --preset anima --model C:/models/my-model.gguf --prompt "a cat"
 
-# Batch test — multiple prompts, parallel inference
+# Batch test - multiple prompts, parallel inference
 python test_llm.py --mode batch --preset anima --model C:/models/my-model.gguf \
     --prompts "a cat on a windowsill" "sunset over mountains" "cyberpunk city street"
 
@@ -106,5 +130,5 @@ A debug log is written to `enhance_debug.log` in the extension root directory. I
 ## Requirements
 
 - **Stable Diffusion WebUI Forge** (or compatible Auto1111 fork)
-- **llama.cpp** — specifically the `llama-server` binary
+- **llama.cpp** - specifically the `llama-server` binary
 - A GGUF model file

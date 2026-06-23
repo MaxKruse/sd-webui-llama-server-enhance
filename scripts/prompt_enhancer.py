@@ -34,7 +34,7 @@ from prompt_enhancer.llm import (
     _kill_server,
     enhance_prompt,
 )
-from prompt_enhancer.presets import AUTO_PRESET, load_preset, list_presets, resolve_preset
+from prompt_enhancer.presets import AUTO_PRESET, load_preset, resolve_preset
 
 logger = logging.getLogger(__name__)
 
@@ -69,21 +69,55 @@ def _dynamic_prompts_installed() -> bool:
     return (_EXTENSIONS_DIR / "sd-dynamic-prompts").is_dir()
 
 
-def _build_resolution_instruction(width: int, height: int) -> str:
+def _get_effective_dimensions(p) -> tuple[int, int]:
+    """Get the final output dimensions, accounting for hires fix.
+
+    Returns (width, height) of the final rendered image.
+    Mirrors the logic in StableDiffusionProcessingTxt2Img.calculate_target_resolution().
+    """
+    if not getattr(p, "enable_hr", False):
+        return (p.width, p.height)
+
+    hr_resize_x = getattr(p, "hr_resize_x", 0)
+    hr_resize_y = getattr(p, "hr_resize_y", 0)
+
+    if hr_resize_x == 0 and hr_resize_y == 0:
+        hr_scale = getattr(p, "hr_scale", 2.0)
+        return (round(p.width * hr_scale), round(p.height * hr_scale))
+
+    if hr_resize_y == 0:
+        return (hr_resize_x, round(hr_resize_x * (p.height / p.width)))
+    elif hr_resize_x == 0:
+        return (round(hr_resize_y * (p.width / p.height)), hr_resize_y)
+
+    return (hr_resize_x, hr_resize_y)
+
+
+def _build_resolution_instruction(width: int, height: int, *, hires: bool = False, base_width: int = 0, base_height: int = 0) -> str:
     """Build a resolution hint block for the LLM system prompt.
 
     Tells the LLM the target image dimensions and orientation so it can
     frame compositions, aspect ratios, and layout descriptions appropriately.
+    Includes hires fix info when applicable.
     """
     gcd = __import__("math").gcd(width, height)
     ratio_w, ratio_h = width // gcd, height // gcd
     orientation = "portrait" if height > width else "landscape" if width > height else "square"
 
-    return (
+    block = (
         f"\n\n--- Image Resolution ---\n"
-        f"Target resolution: {width}x{height} ({orientation}, {ratio_w}:{ratio_h} aspect ratio)\n"
+        f"Final output resolution: {width}x{height} ({orientation}, {ratio_w}:{ratio_h} aspect ratio)\n"
         f"Frame your description to suit this orientation."
     )
+
+    if hires and base_width > 0 and base_height > 0:
+        base_gcd = __import__("math").gcd(base_width, base_height)
+        base_ratio_w, base_ratio_h = base_width // base_gcd, base_height // base_gcd
+        block += (
+            f"\nBase generation resolution: {base_width}x{base_height} ({base_ratio_w}:{base_ratio_h}, hires fix upscaling to final)"
+        )
+
+    return block
 
 
 def _build_negative_prompt_instruction() -> str:
@@ -144,6 +178,9 @@ def _build_base_system_prompt(
     *,
     width: int = 0,
     height: int = 0,
+    hires: bool = False,
+    base_width: int = 0,
+    base_height: int = 0,
 ) -> str:
     """Return the preset content with optional resolution and DP instructions appended.
 
@@ -153,7 +190,12 @@ def _build_base_system_prompt(
 
     # Append resolution info if dimensions provided
     if width > 0 and height > 0:
-        result += _build_resolution_instruction(width, height)
+        result += _build_resolution_instruction(
+            width, height,
+            hires=hires,
+            base_width=base_width,
+            base_height=base_height,
+        )
 
     # Append Dynamic Prompts wildcard preservation note
     dp_instruction = _build_dp_wildcard_instruction()
@@ -168,9 +210,19 @@ def _effective_system_prompt(
     *,
     width: int = 0,
     height: int = 0,
+    hires: bool = False,
+    base_width: int = 0,
+    base_height: int = 0,
 ) -> str:
     """System prompt for the positive-prompt enhancement call."""
-    return _build_base_system_prompt(preset_content, width=width, height=height)
+    return _build_base_system_prompt(
+        preset_content,
+        width=width,
+        height=height,
+        hires=hires,
+        base_width=base_width,
+        base_height=base_height,
+    )
 
 
 def _effective_negative_system_prompt(
@@ -178,12 +230,22 @@ def _effective_negative_system_prompt(
     *,
     width: int = 0,
     height: int = 0,
+    hires: bool = False,
+    base_width: int = 0,
+    base_height: int = 0,
 ) -> str:
     """System prompt for the negative-prompt enhancement call.
 
     Same base as positive, plus the negative-enhancement instruction block.
     """
-    return _build_base_system_prompt(preset_content, width=width, height=height) + _build_negative_prompt_instruction()
+    return _build_base_system_prompt(
+        preset_content,
+        width=width,
+        height=height,
+        hires=hires,
+        base_width=base_width,
+        base_height=base_height,
+    ) + _build_negative_prompt_instruction()
 
 
 class Script(scripts.Script):
@@ -200,29 +262,15 @@ class Script(scripts.Script):
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
-        file_choices = list_presets()
-        # "Auto" first, then file-based presets
-        choices = [AUTO_PRESET] + file_choices
-        current = shared.opts.llama_enhance_preset
-        value = current if current in choices else AUTO_PRESET
-
         with InputAccordion(
             value=False,
             label="LLama Server Enhance",
             elem_id=self.elem_id("main-accordion"),
         ) as enable:
-            preset_dropdown = gr.Dropdown(
-                choices=choices,
-                value=value,
-                label="System prompt preset",
-                info="Auto: select preset based on the Forge-Neo UI preset (flux→flux-dev, zit→z-image-turbo, anima→anima)",
-                interactive=True,
-                elem_id=self.elem_id("preset"),
-            )
-            refresh_btn = gr.Button(
-                value="\U0001f504",
-                variant="tool",
-                elem_id=self.elem_id("refresh-presets"),
+            gr.HTML(
+                value="<small>Preset is auto-selected based on the Forge-Neo UI preset "
+                "(flux→flux-dev, zit→z-image-turbo, anima→anima).</small>",
+                elem_id=self.elem_id("preset-info"),
             )
             enhance_mode = gr.Dropdown(
                 choices=["Per image", "Once"],
@@ -240,40 +288,18 @@ class Script(scripts.Script):
                 elem_id=self.elem_id("enhance-negative"),
             )
 
-            def on_refresh():
-                file_choices = list_presets()
-                choices = [AUTO_PRESET] + file_choices
-                return gr.update(
-                    choices=choices,
-                    value=AUTO_PRESET,
-                )
-
-            refresh_btn.click(
-                fn=on_refresh,
-                inputs=[],
-                outputs=[preset_dropdown],
-            )
-
-            # Persist dropdown selection back to settings so it survives page reloads
-            preset_dropdown.change(
-                fn=lambda chosen: (shared.opts.set("llama_enhance_preset", chosen), shared.opts.save()),
-                inputs=[preset_dropdown],
-                outputs=[],
-            )
-
-        return [enable, preset_dropdown, enhance_mode, enhance_negative]
+        return [enable, enhance_mode, enhance_negative]
 
     def process(
         self,
         p: StableDiffusionProcessing,
         enable: bool,
-        preset_name: str,
         enhance_mode: str,
         enhance_negative: bool,
     ):
         """Called once before any sampling. Enhance prompts here."""
         _log_to_file("=" * 72)
-        _log_to_file(f"process() entered — enable={enable!r}, preset={preset_name!r}, mode={enhance_mode!r}, enhance_negative={enhance_negative!r}")
+        _log_to_file(f"process() entered — enable={enable!r}, mode={enhance_mode!r}, enhance_negative={enhance_negative!r}")
         _log_to_file(f"  p.all_prompts (input)  = {p.all_prompts!r}")
         _log_to_file(f"  p.all_negative_prompts (input) = {p.all_negative_prompts!r}")
         _log_to_file(f"  p.n_iter = {p.n_iter}, p.batch_size = {p.batch_size}")
@@ -285,15 +311,15 @@ class Script(scripts.Script):
         # Free GPU memory before starting llama-server so it has room for its model
         _free_gpu_memory()
 
-        # Resolve preset — handle "Auto" selection based on Forge-Neo UI preset
+        # Resolve preset — always auto-selected based on Forge-Neo UI preset
         forge_preset = getattr(shared.opts, "forge_preset", None)
         checkpoint_name = getattr(shared.opts, "sd_model_checkpoint", None)
         resolved = resolve_preset(
-            preset_name,
+            AUTO_PRESET,
             forge_preset=forge_preset,
             checkpoint_name=checkpoint_name,
         )
-        _log_to_file(f"  preset={preset_name!r}, forge_preset={forge_preset!r}, checkpoint={checkpoint_name!r} → resolved={resolved!r}")
+        _log_to_file(f"  forge_preset={forge_preset!r}, checkpoint={checkpoint_name!r} → resolved={resolved!r}")
 
         if not resolved:
             _log_to_file("  → no preset resolved, skipping")
@@ -305,16 +331,32 @@ class Script(scripts.Script):
             _log_to_file(f"  → preset '{resolved}' not found, skipping")
             return
 
+        # Determine effective output dimensions (final after hires fix)
+        hires_enabled = getattr(p, "enable_hr", False)
+        final_w, final_h = _get_effective_dimensions(p)
+        base_w, base_h = p.width, p.height
+
+        _log_to_file(
+            f"  dimensions: base={base_w}x{base_h}, "
+            f"hires={hires_enabled}, final={final_w}x{final_h}"
+        )
+
         # Build system prompts (preset + resolution + Dynamic Prompts wildcard note)
         system_prompt = _effective_system_prompt(
             preset_content,
-            width=p.width,
-            height=p.height,
+            width=final_w,
+            height=final_h,
+            hires=hires_enabled,
+            base_width=base_w,
+            base_height=base_h,
         )
         negative_system_prompt = _effective_negative_system_prompt(
             preset_content,
-            width=p.width,
-            height=p.height,
+            width=final_w,
+            height=final_h,
+            hires=hires_enabled,
+            base_width=base_w,
+            base_height=base_h,
         ) if enhance_negative else None
         _log_to_file(f"  system_prompt ({len(system_prompt)} chars): {system_prompt[:200]}...")
         if negative_system_prompt:

@@ -5,14 +5,7 @@ This file is intended for human reading and was written with the assistance of a
 
 from __future__ import annotations
 
-import gradio as gr
 from modules import shared
-
-from prompt_enhancer.presets import AUTO_PRESET, list_presets
-
-
-# Build dropdown choices at import time so the settings tab shows a proper selector.
-_PRESET_CHOICES = [AUTO_PRESET] + list_presets()
 
 
 def on_ui_settings():
@@ -41,15 +34,5 @@ def on_ui_settings():
             "",
             label="Inference flags: Extra flags passed to llama-server (e.g. -ngl 99 --temp 0.8 --top-p 0.9)",
             section=section,
-        ),
-    )
-    shared.opts.add_option(
-        key="llama_enhance_preset",
-        info=shared.OptionInfo(
-            AUTO_PRESET,
-            label="Default preset: Auto selects based on the Forge-Neo UI preset",
-            section=section,
-            component=gr.Dropdown,
-            component_args={"choices": _PRESET_CHOICES, "interactive": True},
         ),
     )
