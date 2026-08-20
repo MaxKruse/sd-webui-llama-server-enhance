@@ -145,6 +145,139 @@ def _build_negative_user_prompt(positive: str, negative: str) -> str:
     return f"POSITIVE: {positive}\n\nNEGATIVE: {negative}"
 
 
+def _escape_accidental_dp_syntax(original: str, enhanced: str) -> str:
+    """Escape variant pipes in LLM-generated text that wasn't in the original prompt.
+
+    When the LLM generates text containing DP variant syntax (e.g. {red|blue})
+    that wasn't present in the user's original prompt, those pipes would be
+    misinterpreted by the Dynamic Prompts parser. This function detects such
+    accidental syntax and replaces the pipes with commas.
+
+    Handles configurable separators (variant_start, variant_end, wildcard_wrap)
+    read from shared.opts.
+
+    Args:
+        original: The user's original prompt (before enhancement).
+        enhanced: The LLM-enhanced prompt.
+
+    Returns:
+        The enhanced prompt with accidental variant pipes escaped.
+    """
+    v_start = getattr(shared.opts, "dp_parser_variant_start", "{") or "{"
+    v_end = getattr(shared.opts, "dp_parser_variant_end", "}") or "}"
+    wc_wrap = getattr(shared.opts, "dp_parser_wildcard_wrap", "__") or "__"
+
+    # Collect all original variant blocks for comparison
+    original_variants: set[str] = set()
+    _extract_variant_blocks(original, v_start, v_end, original_variants)
+
+    result: list[str] = []
+    i = 0
+    while i < len(enhanced):
+        # Check for variant start at position i
+        if enhanced[i:i + len(v_start)] == v_start:
+            # Find the matching end (handles nested variants)
+            end_pos = _find_matching_variant_end(enhanced, i + len(v_start), v_start, v_end)
+            if end_pos is not None:
+                full_block = enhanced[i:end_pos + len(v_end)]
+                inner = full_block[len(v_start):-len(v_end)]
+
+                # Skip if the variant contains wildcard syntax (e.g. {__style__|realistic})
+                # The LLM was instructed to preserve wildcards, so variants containing
+                # them are intentional and should be kept as-is.
+                if _contains_wildcard(inner, wc_wrap):
+                    result.append(full_block)
+                    i = end_pos + len(v_end)
+                    continue
+
+                # If this exact block was in the original, preserve it
+                if full_block in original_variants:
+                    result.append(full_block)
+                    i = end_pos + len(v_end)
+                    continue
+
+                # Accidental DP syntax - escape pipes inside
+                inner_escaped = inner.replace("|", ",")
+                result.append(f"{v_start}{inner_escaped}{v_end}")
+                i = end_pos + len(v_end)
+                continue
+
+        result.append(enhanced[i])
+        i += 1
+
+    return "".join(result)
+
+
+def _contains_wildcard(text: str, wc_wrap: str) -> bool:
+    """Check if text contains a wildcard token (wc_wrap + name + wc_wrap)."""
+    if not wc_wrap:
+        return False
+    # Look for pattern: wc_wrap ... wc_wrap where there's at least one char between
+    wc_len = len(wc_wrap)
+    if wc_len * 2 + 1 > len(text):
+        return False
+    first = text.find(wc_wrap)
+    if first < 0:
+        return False
+    second = text.find(wc_wrap, first + wc_len)
+    return second > first + wc_len  # At least one char between the wraps
+
+
+def _extract_variant_blocks(text: str, v_start: str, v_end: str, out: set[str]):
+    """Extract all variant blocks from text and add them to the out set."""
+    i = 0
+    while i < len(text):
+        if text[i:i + len(v_start)] == v_start:
+            end_pos = _find_matching_variant_end(text, i + len(v_start), v_start, v_end)
+            if end_pos is not None:
+                full_block = text[i:end_pos + len(v_end)]
+                out.add(full_block)
+                i = end_pos + len(v_end)
+                continue
+        i += 1
+
+
+def _find_matching_variant_end(text: str, start: int, v_start: str, v_end: str) -> int | None:
+    """Find the position of the matching variant_end, accounting for nesting.
+
+    Returns the index of the first character of variant_end, or None if not found.
+
+    When v_start == v_end (e.g. both are '###'), we check v_end FIRST so the
+    closing token is matched before the opening token, keeping depth correct.
+    """
+    same_delim = v_start == v_end
+    depth = 1
+    i = start
+    limit = len(text) - len(v_end)
+    while i <= limit:
+        if same_delim:
+            # When delimiters are identical, check end first so we close before opening
+            if text[i:i + len(v_end)] == v_end:
+                depth -= 1
+                if depth == 0:
+                    return i
+                i += len(v_end)
+                continue
+            # Also acts as start (nesting)
+            if text[i:i + len(v_start)] == v_start:
+                depth += 1
+                i += len(v_start)
+                continue
+        else:
+            if text[i:i + len(v_start)] == v_start:
+                depth += 1
+                i += len(v_start)
+                continue
+            if text[i:i + len(v_end)] == v_end:
+                depth -= 1
+                if depth == 0:
+                    return i
+                i += len(v_end)
+                continue
+        i += 1
+    return None
+
+
 def _build_dp_wildcard_instruction() -> str:
     """Build a wildcard-preservation instruction for the LLM system prompt.
 
@@ -251,9 +384,9 @@ def _effective_negative_system_prompt(
 class Script(scripts.Script):
     """Enhance positive prompts through a local LLM (llama-server)."""
 
-    # Run AFTER sd-dynamic-prompts (priority 1000) so our enhanced prompt
-    # is the FINAL value of p.all_prompts and isn't overwritten by DP.
-    sorting_priority = 1001
+    # Run BEFORE sd-dynamic-prompts (priority 1000) so we enhance the raw
+    # prompt (with wildcards/variants intact), then DP expands them.
+    sorting_priority = 999
 
     def title(self):
         return "LLama Server Enhance"
@@ -399,6 +532,10 @@ class Script(scripts.Script):
                 return
 
             enhanced_positive = pos_result.content
+
+            # Escape accidental DP syntax in the enhanced prompt
+            enhanced_positive = _escape_accidental_dp_syntax(original, enhanced_positive)
+
             _log_to_file(
                 f"  → Once mode: positive enhanced ({len(enhanced_positive)} chars, "
                 f"{pos_result.completion_tokens} tokens, {pos_result.generation_tps:.1f} tok/s, "
@@ -421,6 +558,10 @@ class Script(scripts.Script):
 
                 if neg_result.content:
                     enhanced_negative = neg_result.content
+
+                    # Escape accidental DP syntax in the enhanced negative prompt
+                    enhanced_negative = _escape_accidental_dp_syntax(original_negative, enhanced_negative)
+
                     _log_to_file(
                         f"  → Once mode: negative enhanced ({len(enhanced_negative)} chars, "
                         f"{neg_result.completion_tokens} tokens, {neg_result.generation_tps:.1f} tok/s, "
@@ -551,9 +692,13 @@ class Script(scripts.Script):
                     f"{result.completion_tokens} tokens, {result.generation_tps:.1f} tok/s, "
                     f"{result.total_ms:.0f}ms total)"
                 )
-                logger.info("Prompt %d enhanced: %s → %s", idx + 1, original[:60], result.content[:60])
-                print(f"  Enhanced prompt {idx + 1} (full): {result.content}")
-                enhanced_prompts[idx] = result.content
+
+                # Escape accidental DP syntax in the enhanced prompt
+                escaped_content = _escape_accidental_dp_syntax(original, result.content)
+
+                logger.info("Prompt %d enhanced: %s → %s", idx + 1, original[:60], escaped_content[:60])
+                print(f"  Enhanced prompt {idx + 1} (full): {escaped_content}")
+                enhanced_prompts[idx] = escaped_content
                 successful_indices.append(idx)
             else:
                 error_detail = result.error if result and result.error else "no result"
@@ -594,9 +739,13 @@ class Script(scripts.Script):
                         f"{result.completion_tokens} tokens, {result.generation_tps:.1f} tok/s, "
                         f"{result.total_ms:.0f}ms total)"
                     )
-                    logger.info("Negative %d enhanced: %s → %s", idx + 1, original_negative[:60], result.content[:60])
-                    print(f"  Enhanced negative {idx + 1} (full): {result.content}")
-                    enhanced_negatives[idx] = result.content
+
+                    # Escape accidental DP syntax in the enhanced negative prompt
+                    escaped_negative = _escape_accidental_dp_syntax(original_negative, result.content)
+
+                    logger.info("Negative %d enhanced: %s → %s", idx + 1, original_negative[:60], escaped_negative[:60])
+                    print(f"  Enhanced negative {idx + 1} (full): {escaped_negative}")
+                    enhanced_negatives[idx] = escaped_negative
                 # else: keep original negative (already set as baseline)
 
         # Kill the server and capture stderr for diagnostics
