@@ -23,6 +23,7 @@ from prompt_enhancer import settings as _settings_module
 from prompt_enhancer.llm import (
     ChatResult,
     _SERVER_STARTUP_TIMEOUT,
+    _ServerProcess,
     _discover_model_name,
     _discover_slot_count,
     _find_free_port,
@@ -83,6 +84,74 @@ def _read_request_timeout() -> float:
     except (TypeError, ValueError):
         logger.warning("Invalid llama_enhance_timeout value - falling back to 120s")
         return 120.0
+
+
+def _read_startup_timeout() -> float:
+    """Read the server startup timeout from settings (seconds)."""
+    try:
+        return float(
+            getattr(shared.opts, "llama_enhance_startup_timeout", _SERVER_STARTUP_TIMEOUT)
+            or _SERVER_STARTUP_TIMEOUT
+        )
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid llama_enhance_startup_timeout value - falling back to %ss",
+            _SERVER_STARTUP_TIMEOUT,
+        )
+        return float(_SERVER_STARTUP_TIMEOUT)
+
+
+def _spawn_healthy_server(
+    server_path: str,
+    model_path: str,
+    extra_flags: str,
+    label: str = "",
+) -> _ServerProcess | None:
+    """Start llama-server and wait until it becomes healthy.
+
+    Streams the server's stderr into the debug log while it runs.
+    Returns the server handle, or None on failure (already logged and killed).
+    """
+    port = _find_free_port()
+    print(f"\n  Running llama-server (model: {Path(model_path).name}, port: {port}){label}...")
+
+    def _on_stderr(chunk: str):
+        for line in chunk.rstrip("\n").split("\n"):
+            if line.strip():
+                _log_to_file(f"  [llama-server] {line}")
+
+    try:
+        sp = spawn_server(server_path, model_path, port, extra_flags, on_stderr=_on_stderr)
+    except FileNotFoundError:
+        logger.error("llama-server not found at: %s", server_path)
+        print(f"  FAILED: llama-server not found at: {server_path}")
+        _log_to_file(f"  → llama-server not found at {server_path}")
+        return None
+    except Exception:
+        logger.exception("Failed to start llama-server")
+        _log_to_file("  → failed to start llama-server")
+        return None
+
+    startup_timeout = _read_startup_timeout()
+    print(f"  Waiting for server to start (timeout: {startup_timeout:.0f}s)...")
+    start = time.monotonic()
+
+    if not _wait_for_server(sp.base_url, timeout=startup_timeout, proc=sp.proc):
+        elapsed = time.monotonic() - start
+        print(f"  FAILED: Server did not become healthy within {startup_timeout:.0f}s ({elapsed:.1f}s elapsed)")
+        logger.error("Server did not become healthy within %.0fs", startup_timeout)
+        _log_to_file(f"  → server health check failed after {elapsed:.1f}s")
+        stderr_tail = sp.stderr_tail(3000)
+        if stderr_tail.strip():
+            _log_to_file(f"  llama-server stderr (last 3000 chars):\n{stderr_tail}")
+            print(f"  Server stderr (last 500 chars):\n{stderr_tail[-500:]}")
+        _kill_server(sp)
+        return None
+
+    elapsed = time.monotonic() - start
+    print(f"  Server ready on port {port} in {elapsed:.1f}s")
+    _log_to_file(f"  Server ready on port {port} in {elapsed:.1f}s")
+    return sp
 
 
 def _free_gpu_memory():
@@ -636,45 +705,17 @@ class LlamaServerEnhance(scripts.Script):
             _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
             return
 
-        # Start a single server instance (output pipes drained continuously so
-        # the server can never block on a full OS pipe buffer)
-        port = _find_free_port()
-        print(f"\n  Running llama-server (model: {Path(model_path).name}, port: {port}), {len(prompts_to_enhance)} prompt(s)...")
-
-        try:
-            sp = spawn_server(server_path, model_path, port, extra_flags)
-        except FileNotFoundError:
-            logger.error("llama-server not found at: %s", server_path)
-            print(f"  FAILED: llama-server not found at: {server_path}")
-            _log_to_file(f"  → llama-server not found at {server_path}")
-            _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
-            return
-        except Exception:
-            logger.exception("Failed to start llama-server")
-            _log_to_file("  → failed to start llama-server")
+        # Start a single server instance (the helper drains the pipes,
+        # streams stderr into the debug log, and waits for health)
+        sp = _spawn_healthy_server(
+            server_path, model_path, extra_flags,
+            label=f", {len(prompts_to_enhance)} prompt(s)",
+        )
+        if sp is None:
             _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
             return
 
         base_url = sp.base_url
-
-        # Wait for server to become healthy
-        print(f"  Waiting for server to start (timeout: {_SERVER_STARTUP_TIMEOUT}s)...")
-        start = time.monotonic()
-
-        if not _wait_for_server(base_url, proc=sp.proc):
-            elapsed = time.monotonic() - start
-            print(f"  FAILED: Server did not become healthy within {_SERVER_STARTUP_TIMEOUT}s ({elapsed:.1f}s elapsed)")
-            logger.error("Server did not become healthy within %ds", _SERVER_STARTUP_TIMEOUT)
-            _log_to_file(f"  → server health check failed after {elapsed:.1f}s")
-            stderr_tail = sp.stderr_tail(3000)
-            if stderr_tail.strip():
-                _log_to_file(f"  llama-server stderr (last 3000 chars):\n{stderr_tail}")
-                print(f"  Server stderr (last 500 chars):\n{stderr_tail[-500:]}")
-            _kill_server(sp)
-            _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
-            return
-
-        ready_time = time.monotonic()
 
         # Discover the loaded model name
         model_name = _discover_model_name(base_url)
@@ -684,11 +725,7 @@ class LlamaServerEnhance(scripts.Script):
         slot_count = _discover_slot_count(base_url, model_name)
         _log_to_file(f"  Discovered {slot_count} slot(s)")
 
-        print(
-            f"  Server ready on port {port} in {ready_time - start:.1f}s. "
-            f"Model: {model_name}, Slots: {slot_count}"
-        )
-        _log_to_file(f"  Server ready in {ready_time - start:.1f}s")
+        print(f"  Model: {model_name}, Slots: {slot_count}")
 
         # Warm up the chat endpoint — /health returns 200 before parallel slots
         # are initialized, causing HTTP 400 on the first real request.

@@ -141,12 +141,15 @@ class _PipeDrainer(threading.Thread):
     last _DRAIN_MAX_BYTES of output for diagnostics.
     """
 
-    def __init__(self, name: str, stream):
+    def __init__(self, name: str, stream, on_chunk=None):
         super().__init__(name=name, daemon=True)
         self._stream = stream
         self._chunks: list[bytes] = []
         self._size = 0
         self._lock = Lock()
+        # Optional callback invoked with each decoded chunk (e.g. to stream
+        # output into a log file). Must be thread-safe and quick.
+        self._on_chunk = on_chunk
 
     def run(self) -> None:
         while True:
@@ -158,6 +161,11 @@ class _PipeDrainer(threading.Thread):
                 self._size += len(chunk)
                 while self._size > _DRAIN_MAX_BYTES and len(self._chunks) > 1:
                     self._size -= len(self._chunks.pop(0))
+            if self._on_chunk is not None:
+                try:
+                    self._on_chunk(chunk.decode("utf-8", errors="replace"))
+                except Exception:
+                    logger.exception("on_chunk callback failed (continuing to drain)")
 
     def tail(self, max_chars: int = 3000) -> str:
         """Return the tail of the captured output as text."""
@@ -169,12 +177,12 @@ class _PipeDrainer(threading.Thread):
 class _ServerProcess:
     """A spawned llama-server with drained output pipes and lifecycle helpers."""
 
-    def __init__(self, proc: subprocess.Popen, port: int):
+    def __init__(self, proc: subprocess.Popen, port: int, on_stderr=None):
         self.proc = proc
         self.port = port
         self.base_url = f"http://127.0.0.1:{port}"
         self._stdout_drainer = _PipeDrainer("llama-server-stdout", proc.stdout)
-        self._stderr_drainer = _PipeDrainer("llama-server-stderr", proc.stderr)
+        self._stderr_drainer = _PipeDrainer("llama-server-stderr", proc.stderr, on_chunk=on_stderr)
 
     @property
     def pid(self) -> int:
@@ -201,6 +209,7 @@ def spawn_server(
     model_path: str,
     port: int,
     extra_flags: str,
+    on_stderr=None,
 ) -> _ServerProcess:
     """Start a llama-server subprocess with continuously drained output pipes.
 
@@ -223,7 +232,7 @@ def spawn_server(
     logger.info("llama-server started (pid=%s, port=%s)", proc.pid, port)
     print(f"  Started llama-server (pid={proc.pid}, port={port})")
 
-    sp = _ServerProcess(proc, port)
+    sp = _ServerProcess(proc, port, on_stderr=on_stderr)
     sp.start_drainers()
     return sp
 
