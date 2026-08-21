@@ -29,6 +29,14 @@ def on_ui_settings():
         ),
     )
     shared.opts.add_option(
+        key="llama_enhance_timeout",
+        info=shared.OptionInfo(
+            120,
+            label="Request timeout: Seconds to wait for a single LLM request before retrying (default: 120)",
+            section=section,
+        ),
+    )
+    shared.opts.add_option(
         key="llama_enhance_extra_flags",
         info=shared.OptionInfo(
             "",
