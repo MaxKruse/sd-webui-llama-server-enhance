@@ -9,7 +9,7 @@ Drop this extension into your `extensions/` folder and get per-image prompt enha
 - **Batch mode** - starts a single `llama-server` instance and sends all prompts in parallel, eliminating per-image startup penalties
 - **Auto preset selection** - automatically selects the correct system prompt preset based on the Forge-Neo UI preset (flux, zit, anima)
 - **Hires fix aware** - provides the LLM with final output dimensions (after hires fix upscaling) so it can frame compositions appropriately
-- **Dynamic Prompts integration** - runs before DP so wildcards/variants are preserved and expanded after enhancement; automatically escapes accidental DP syntax in LLM output; supports custom DP separators (configurable `variant_start`, `variant_end`, `wildcard_wrap`)
+- **Dynamic Prompts integration** - automatically escapes accidental DP syntax in LLM output; supports custom DP separators (configurable `variant_start`, `variant_end`, `wildcard_wrap`). See [Dynamic Prompts Integration](#dynamic-prompts-integration) for execution order
 - **Two enhancement modes**:
   - **Per image** - enhance each prompt individually (batch-optimized: one server, parallel requests)
   - **Once** - enhance one prompt and apply it to all images in the batch
@@ -80,13 +80,17 @@ This allows the LLM to frame compositions, describe layouts, and choose appropri
 
 ## Dynamic Prompts Integration
 
-When the [sd-dynamic-prompts](https://github.com/DecadenceAI/sd-dynamic-prompts) extension is installed, this extension runs **before** DP in the script pipeline (priority 999 vs DP's 1000). This means:
+When the [sd-dynamic-prompts](https://github.com/DecadenceAI/sd-dynamic-prompts) extension is installed, the two extensions interact. **Execution order**: Forge runs script `process()` callbacks in extension discovery order (directory name, alphabetical), so **DP runs first** and this extension enhances the already-expanded prompt. If you want the other way around - enhance the raw prompt with wildcards/variants intact, then let DP expand them - pin the order via **Settings -> "script_process callback priority"**: move `LlamaServerEnhance` above `Script` (DP's class name).
+
+In the intended order (this extension first), the pipeline is:
 
 1. **Raw prompt with wildcards** is sent to the LLM for enhancement
 2. The LLM is instructed to preserve `__wildcard__` and `{variant|syntax}` tokens verbatim
 3. **Auto-escaping** - any variant syntax the LLM accidentally generates (that wasn't in your original prompt) has its pipes escaped to commas, preventing DP misinterpretation
 4. **Custom separator support** - reads your DP settings (`dp_parser_variant_start`, `dp_parser_variant_end`, `dp_parser_wildcard_wrap`) and handles any custom separator configuration
 5. DP then expands the wildcards/variants in the enhanced prompt
+
+In the default order (DP first) the escaping logic is harmless: it only touches variant syntax the LLM generated that was not present in the prompt it received.
 
 ### How Escaping Works
 
@@ -98,13 +102,11 @@ The extension compares variant blocks in the enhanced output against your origin
 
 This ensures the LLM can freely describe things like "a cat or dog" without the output being misinterpreted as a DP variant.
 
-## How It Works
-
 ### Single prompt (Once mode)
 
 1. Find a free TCP port in the ephemeral range (49152-65535)
 2. Start `llama-server` on that port with `--no-ui --no-warmup`
-3. Poll `/health` until the model is loaded and ready (60s timeout)
+3. Poll `/health` until the model is loaded and ready (60s timeout, aborts early if the process exits)
 4. Send the prompt via `/v1/chat/completions`
 5. Kill the server process
 
