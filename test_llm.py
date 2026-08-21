@@ -31,7 +31,6 @@ from __future__ import annotations
 import argparse
 import json
 import random
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -48,6 +47,7 @@ from prompt_enhancer.llm import (
     _wait_for_server,
     _batch_chat_completions,
     enhance_prompt,
+    spawn_server,
 )
 from prompt_enhancer.presets import list_presets, load_preset, PRESETS_DIR
 
@@ -133,7 +133,7 @@ def test_model_exists(model_path: str):
     return False
 
 
-def test_single(server_path: str, model_path: str, system_prompt: str, user_prompt: str, extra_flags: str):
+def test_single(server_path: str, model_path: str, system_prompt: str, user_prompt: str, extra_flags: str, request_timeout: float = 120):
     """Single-prompt mode: start server, send one prompt, kill server."""
     _print_header("Live Inference Test (Single Prompt)")
 
@@ -146,6 +146,7 @@ def test_single(server_path: str, model_path: str, system_prompt: str, user_prom
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         extra_flags=extra_flags,
+        request_timeout=request_timeout,
     )
 
     elapsed = time.monotonic() - start
@@ -160,25 +161,14 @@ def test_single(server_path: str, model_path: str, system_prompt: str, user_prom
 
 
 def _start_server(server_path: str, model_path: str, extra_flags: str):
-    """Start a llama-server and return (base_url, server_proc) or (None, None) on failure."""
+    """Start a llama-server (with drained output pipes) and return
+    (base_url, sp) or (None, None) on failure."""
     port = _find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    cmd = _build_command(server_path, model_path, port, extra_flags)
 
     print(f"\n  Running llama-server (model: {Path(model_path).name}, port: {port})...")
 
-    creationflags = 0
-    if sys.platform == "win32":
-        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
-
     try:
-        server_proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            creationflags=creationflags,
-        )
-        print(f"  Started llama-server (pid={server_proc.pid}, port={port})")
+        sp = spawn_server(server_path, model_path, port, extra_flags)
     except FileNotFoundError:
         print(f"  FAILED: llama-server not found at: {server_path}")
         return None, None
@@ -189,15 +179,18 @@ def _start_server(server_path: str, model_path: str, extra_flags: str):
     print(f"  Waiting for server to start (timeout: {_SERVER_STARTUP_TIMEOUT}s)...")
     start = time.monotonic()
 
-    if not _wait_for_server(base_url):
+    if not _wait_for_server(sp.base_url, proc=sp.proc):
         elapsed = time.monotonic() - start
         print(f"  FAILED: Server did not become healthy within {_SERVER_STARTUP_TIMEOUT}s ({elapsed:.1f}s elapsed)")
-        _kill_server(server_proc)
+        stderr_tail = sp.stderr_tail(3000)
+        if stderr_tail.strip():
+            print(f"  Server stderr (last 500 chars):\n{stderr_tail[-500:]}")
+        _kill_server(sp)
         return None, None
 
     ready_time = time.monotonic()
     print(f"  Server ready on port {port} in {ready_time - start:.1f}s")
-    return base_url, server_proc
+    return sp.base_url, sp
 
 
 def test_batch(
@@ -206,6 +199,7 @@ def test_batch(
     system_prompt: str,
     user_prompts: list[str],
     extra_flags: str,
+    request_timeout: float = 120,
 ):
     """Batch mode: start ONE server, send ALL prompts in parallel, collect all, kill."""
     _print_header(f"Live Inference Test (Batch — {len(user_prompts)} prompt(s))")
@@ -225,7 +219,7 @@ def test_batch(
     # Send all prompts concurrently
     print(f"  Sending {len(prompts_to_enhance)} prompt(s) in parallel...")
     start = time.monotonic()
-    results = _batch_chat_completions(base_url, model_name, system_prompt, prompts_to_enhance)
+    results = _batch_chat_completions(base_url, model_name, system_prompt, prompts_to_enhance, request_timeout=request_timeout)
     elapsed = time.monotonic() - start
 
     # Kill the server
@@ -285,6 +279,12 @@ def main():
     parser.add_argument("--server", type=str, default="llama-server", help="Path to llama-server binary")
     parser.add_argument("--flags", type=str, default="", help="Extra inference flags for llama-server")
     parser.add_argument("--dry-run", action="store_true", help="Build command but don't execute")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=120,
+        help="Seconds to wait for a single LLM request before retrying (default: 120)",
+    )
 
     args = parser.parse_args()
 
@@ -360,6 +360,7 @@ def main():
             system_prompt=system_prompt,
             user_prompts=user_prompts,
             extra_flags=args.flags,
+            request_timeout=args.timeout,
         )
     else:
         test_single(
@@ -368,6 +369,7 @@ def main():
             system_prompt=system_prompt,
             user_prompt=user_prompts[0],
             extra_flags=args.flags,
+            request_timeout=args.timeout,
         )
 
     _print_header("All tests complete")

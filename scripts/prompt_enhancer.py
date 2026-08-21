@@ -6,8 +6,6 @@ This file was modified with the assistance of an LLM.
 from __future__ import annotations
 
 import logging
-import subprocess
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -24,7 +22,6 @@ from prompt_enhancer import settings as _settings_module
 from prompt_enhancer.llm import (
     ChatResult,
     _SERVER_STARTUP_TIMEOUT,
-    _build_command,
     _discover_model_name,
     _discover_slot_count,
     _find_free_port,
@@ -32,6 +29,7 @@ from prompt_enhancer.llm import (
     _warmup_chat_endpoint,
     _batch_chat_completions,
     _kill_server,
+    spawn_server,
     enhance_prompt,
 )
 from prompt_enhancer.presets import AUTO_PRESET, load_preset, resolve_preset
@@ -503,7 +501,7 @@ class Script(scripts.Script):
             return
 
         extra_flags = shared.opts.llama_enhance_extra_flags or ""
-
+        request_timeout = _read_request_timeout()
         # "Once" mode: enhance a single prompt and apply to all images
         if enhance_mode == "Once":
             original = p.all_prompts[0] if p.all_prompts else ""
@@ -521,6 +519,7 @@ class Script(scripts.Script):
                 system_prompt=system_prompt,
                 user_prompt=original,
                 extra_flags=extra_flags,
+                request_timeout=request_timeout,
             )
 
             if not pos_result.content:
@@ -554,6 +553,7 @@ class Script(scripts.Script):
                     system_prompt=negative_system_prompt,
                     user_prompt=neg_user_prompt,
                     extra_flags=extra_flags,
+                    request_timeout=request_timeout,
                 )
 
                 if neg_result.content:
@@ -596,29 +596,13 @@ class Script(scripts.Script):
             _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
             return
 
-        # Start a single server instance
+        # Start a single server instance (output pipes drained continuously so
+        # the server can never block on a full OS pipe buffer)
         port = _find_free_port()
-        base_url = f"http://127.0.0.1:{port}"
-        cmd = _build_command(server_path, model_path, port, extra_flags)
-
-        logger.info("llama-server command: %s", " ".join(cmd))
         print(f"\n  Running llama-server (model: {Path(model_path).name}, port: {port}), {len(prompts_to_enhance)} prompt(s)...")
 
-        # Windows: prevent console window popup
-        creationflags = 0
-        if sys.platform == "win32":
-            creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
-
-        server_proc: subprocess.Popen | None = None
         try:
-            server_proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=creationflags,
-            )
-            logger.info("llama-server started (pid=%s, port=%s)", server_proc.pid, port)
-            print(f"  Started llama-server (pid={server_proc.pid}, port={port})")
+            sp = spawn_server(server_path, model_path, port, extra_flags)
         except FileNotFoundError:
             logger.error("llama-server not found at: %s", server_path)
             print(f"  FAILED: llama-server not found at: {server_path}")
@@ -631,16 +615,22 @@ class Script(scripts.Script):
             _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
             return
 
+        base_url = sp.base_url
+
         # Wait for server to become healthy
         print(f"  Waiting for server to start (timeout: {_SERVER_STARTUP_TIMEOUT}s)...")
         start = time.monotonic()
 
-        if not _wait_for_server(base_url):
+        if not _wait_for_server(base_url, proc=sp.proc):
             elapsed = time.monotonic() - start
             print(f"  FAILED: Server did not become healthy within {_SERVER_STARTUP_TIMEOUT}s ({elapsed:.1f}s elapsed)")
             logger.error("Server did not become healthy within %ds", _SERVER_STARTUP_TIMEOUT)
             _log_to_file(f"  → server health check failed after {elapsed:.1f}s")
-            _kill_server(server_proc)
+            stderr_tail = sp.stderr_tail(3000)
+            if stderr_tail.strip():
+                _log_to_file(f"  llama-server stderr (last 3000 chars):\n{stderr_tail}")
+                print(f"  Server stderr (last 500 chars):\n{stderr_tail[-500:]}")
+            _kill_server(sp)
             _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
             return
 
@@ -673,6 +663,7 @@ class Script(scripts.Script):
         pos_results = _batch_chat_completions(
             base_url, model_name, system_prompt, prompts_to_enhance,
             max_concurrent=slot_count,
+            request_timeout=request_timeout,
         )
         pos_result_map: dict[int, ChatResult] = {idx: result for idx, result in pos_results}
 
@@ -727,6 +718,7 @@ class Script(scripts.Script):
             neg_results = _batch_chat_completions(
                 base_url, model_name, negative_system_prompt, neg_prompts,
                 max_concurrent=slot_count,
+                request_timeout=request_timeout,
             )
             neg_result_map: dict[int, ChatResult] = {idx: result for idx, result in neg_results}
 
@@ -749,15 +741,10 @@ class Script(scripts.Script):
                 # else: keep original negative (already set as baseline)
 
         # Kill the server and capture stderr for diagnostics
-        _kill_server(server_proc)
-        if server_proc and server_proc.stderr:
-            try:
-                stderr_output = server_proc.stderr.read().decode("utf-8", errors="replace")
-                stderr_tail = stderr_output[-3000:]
-                if stderr_tail.strip():
-                    _log_to_file(f"  llama-server stderr (last 3000 chars):\n{stderr_tail}")
-            except Exception:
-                pass
+        _kill_server(sp)
+        stderr_tail = sp.stderr_tail(3000)
+        if stderr_tail.strip():
+            _log_to_file(f"  llama-server stderr (last 3000 chars):\n{stderr_tail}")
 
         p.all_prompts = enhanced_prompts
         p.all_negative_prompts = enhanced_negatives

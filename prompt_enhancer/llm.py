@@ -16,10 +16,11 @@ import random
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from threading import Lock
-from urllib import request, error
+from urllib import error, request
 
 import aiohttp
 import asyncio
@@ -29,8 +30,11 @@ logger = logging.getLogger(__name__)
 # How long to wait for the server to become healthy (model load time).
 _SERVER_STARTUP_TIMEOUT = 60
 
-# Timeout for individual HTTP requests.
+# Timeout for individual health-check polls.
 _HTTP_TIMEOUT = 5
+
+# Seconds to wait for a single chat completion request before giving up on it.
+DEFAULT_REQUEST_TIMEOUT = 120
 
 # Max retries for chat completion requests (transient server errors).
 _MAX_CHAT_RETRIES = 5
@@ -99,12 +103,20 @@ def _build_command(
     return cmd
 
 
-def _wait_for_server(base_url: str, timeout: int = _SERVER_STARTUP_TIMEOUT) -> bool:
-    """Poll /health until the server responds or timeout is reached."""
+def _wait_for_server(
+    base_url: str,
+    timeout: int = _SERVER_STARTUP_TIMEOUT,
+    proc: subprocess.Popen | None = None,
+) -> bool:
+    """Poll /health until the server responds, the timeout is reached, or the
+    process exits early (a crashed server can never become healthy)."""
     deadline = time.monotonic() + timeout
     url = f"{base_url}/health"
 
     while time.monotonic() < deadline:
+        if proc is not None and proc.poll() is not None:
+            logger.error("Server process exited early (code=%s) - aborting health wait", proc.returncode)
+            return False
         try:
             with request.urlopen(url, timeout=_HTTP_TIMEOUT) as resp:
                 if resp.status == 200:
@@ -114,6 +126,106 @@ def _wait_for_server(base_url: str, timeout: int = _SERVER_STARTUP_TIMEOUT) -> b
         time.sleep(0.5)
 
     return False
+
+
+_DRAIN_MAX_BYTES = 256 * 1024
+
+
+class _PipeDrainer(threading.Thread):
+    """Continuously reads a subprocess pipe into a bounded buffer.
+
+    llama-server logs its startup and every task to stderr. Windows anonymous
+    pipes only buffer 4 KB, so without a reader the server's own threads block
+    on write once the buffer fills: /health keeps answering (it never logs) but
+    chat requests hang. Draining keeps the server unblocked and retains the
+    last _DRAIN_MAX_BYTES of output for diagnostics.
+    """
+
+    def __init__(self, name: str, stream):
+        super().__init__(name=name, daemon=True)
+        self._stream = stream
+        self._chunks: list[bytes] = []
+        self._size = 0
+        self._lock = Lock()
+
+    def run(self) -> None:
+        while True:
+            chunk = self._stream.read1(65536)
+            if not chunk:
+                break
+            with self._lock:
+                self._chunks.append(chunk)
+                self._size += len(chunk)
+                while self._size > _DRAIN_MAX_BYTES and len(self._chunks) > 1:
+                    self._size -= len(self._chunks.pop(0))
+
+    def tail(self, max_chars: int = 3000) -> str:
+        """Return the tail of the captured output as text."""
+        with self._lock:
+            data = b"".join(self._chunks)
+        return data.decode("utf-8", errors="replace")[-max_chars:]
+
+
+class _ServerProcess:
+    """A spawned llama-server with drained output pipes and lifecycle helpers."""
+
+    def __init__(self, proc: subprocess.Popen, port: int):
+        self.proc = proc
+        self.port = port
+        self.base_url = f"http://127.0.0.1:{port}"
+        self._stdout_drainer = _PipeDrainer("llama-server-stdout", proc.stdout)
+        self._stderr_drainer = _PipeDrainer("llama-server-stderr", proc.stderr)
+
+    @property
+    def pid(self) -> int:
+        return self.proc.pid
+
+    def start_drainers(self) -> None:
+        self._stdout_drainer.start()
+        self._stderr_drainer.start()
+
+    def stop_drainers(self) -> None:
+        # The process is gone at this point, so pipes hit EOF and joins return fast.
+        self._stdout_drainer.join(timeout=2)
+        self._stderr_drainer.join(timeout=2)
+
+    def stdout_tail(self, max_chars: int = 3000) -> str:
+        return self._stdout_drainer.tail(max_chars)
+
+    def stderr_tail(self, max_chars: int = 3000) -> str:
+        return self._stderr_drainer.tail(max_chars)
+
+
+def spawn_server(
+    server_path: str,
+    model_path: str,
+    port: int,
+    extra_flags: str,
+) -> _ServerProcess:
+    """Start a llama-server subprocess with continuously drained output pipes.
+
+    Raises FileNotFoundError if the binary is not found, or an OSError
+    subclass if the process cannot be created.
+    """
+    cmd = _build_command(server_path, model_path, port, extra_flags)
+    logger.info("llama-server command: %s", " ".join(cmd))
+
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=creationflags,
+    )
+    logger.info("llama-server started (pid=%s, port=%s)", proc.pid, port)
+    print(f"  Started llama-server (pid={proc.pid}, port={port})")
+
+    sp = _ServerProcess(proc, port)
+    sp.start_drainers()
+    return sp
 
 
 _print_lock = Lock()
@@ -275,11 +387,26 @@ def _warmup_chat_endpoint(base_url: str, model_name: str, num_slots: int = 2):
     logger.info("Chat endpoint warmup complete (warmed %d slot(s))", num_slots)
 
 
+def _is_transient_error(exc: BaseException) -> bool:
+    """Return True for errors that a retry is likely to resolve.
+
+    HTTP 4xx (except 408/429) are deterministic client errors (context
+    overflow, unknown model, bad request) - retrying them only burns time.
+    """
+    if isinstance(exc, error.HTTPError):
+        return exc.code in (408, 429) or exc.code >= 500
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return exc.status in (408, 429) or exc.status >= 500
+    return isinstance(exc, (error.URLError, aiohttp.ClientError, json.JSONDecodeError, ConnectionError, TimeoutError, OSError))
+
+
 def _chat_completion(
     base_url: str,
     model_name: str,
     system_prompt: str,
     user_prompt: str,
+    *,
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
 ) -> ChatResult:
     """Send a single chat completion request and return a ChatResult.
 
@@ -288,8 +415,9 @@ def _chat_completion(
     Inference params (max_tokens, temperature, top_p) are omitted so the
     server uses its own defaults.
 
-    Retries up to _MAX_CHAT_RETRIES times on transient errors (HTTP failures,
-    malformed responses, missing choices).
+    Retries up to _MAX_CHAT_RETRIES times, but only on transient errors
+    (connection failures, timeouts, truncated responses, 408/429/5xx).
+    Deterministic 4xx errors fail immediately without retrying.
     """
     payload = {
         "model": model_name,
@@ -313,7 +441,7 @@ def _chat_completion(
         )
 
         try:
-            with request.urlopen(req, timeout=120) as resp:
+            with request.urlopen(req, timeout=request_timeout) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
                 content = result["choices"][0]["message"]["content"]
 
@@ -334,21 +462,24 @@ def _chat_completion(
                     prompt_ms=prompt_ms,
                     predicted_ms=predicted_ms,
                 )
-        except error.HTTPError as exc:
-            try:
-                body = exc.read().decode("utf-8", errors="replace")
-            except Exception:
-                body = "<unreadable>"
-            last_error = f"HTTP {exc.code}: {body[:500]}"
-            logger.error("Chat completion request failed (attempt %d/%d): %s", attempt, _MAX_CHAT_RETRIES, last_error)
-            print(f"  Chat completion request failed (attempt {attempt}/{_MAX_CHAT_RETRIES}): HTTP {exc.code}: {body[:200]}")
-        except (error.URLError, json.JSONDecodeError, KeyError, IndexError) as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
+        except Exception as exc:
+            if isinstance(exc, error.HTTPError):
+                try:
+                    body = exc.read().decode("utf-8", errors="replace")
+                except Exception:
+                    body = "<unreadable>"
+                last_error = f"HTTP {exc.code}: {body[:500]}"
+            else:
+                last_error = f"{type(exc).__name__}: {exc}"
             logger.error("Chat completion request failed (attempt %d/%d): %s", attempt, _MAX_CHAT_RETRIES, last_error)
             print(f"  Chat completion request failed (attempt {attempt}/{_MAX_CHAT_RETRIES}): {last_error}")
 
+            if not _is_transient_error(exc):
+                logger.error("Error is not transient - not retrying")
+                break
+
         # Retry with exponential backoff (skip sleep on last attempt).
-        # Requests can take 16–30 s, so we need wide spacing so later
+        # Requests can take 16-30 s, so we need wide spacing so later
         # attempts land after the first batch frees its slots.
         if attempt < _MAX_CHAT_RETRIES:
             backoff = min(3 * (2 ** (attempt - 1)), 30)  # 3s, 6s, 12s, 24s (capped 30s)
@@ -356,10 +487,10 @@ def _chat_completion(
             print(f"  Retrying in {backoff:.0f}s...")
             time.sleep(backoff)
 
-    # All retries exhausted
+    # Retries exhausted (or a non-transient error)
     error_msg = last_error or "all retries failed"
-    logger.error("Chat completion request failed after %d retries: %s", _MAX_CHAT_RETRIES, error_msg)
-    print(f"  Chat completion request failed after {_MAX_CHAT_RETRIES} retries: {error_msg}")
+    logger.error("Chat completion request failed: %s", error_msg)
+    print(f"  Chat completion request failed: {error_msg}")
     return ChatResult(error=error_msg)
 
 
@@ -370,11 +501,14 @@ async def _chat_completion_async(
     system_prompt: str,
     user_prompt: str,
     index: int,
+    *,
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
 ) -> tuple[int, ChatResult]:
     """Send a single chat completion request via aiohttp and return (index, ChatResult).
 
-    Retries up to _MAX_CHAT_RETRIES times on transient errors (HTTP failures,
-    malformed responses, missing choices).
+    Retries up to _MAX_CHAT_RETRIES times, but only on transient errors
+    (connection failures, timeouts, truncated responses, 408/429/5xx).
+    Deterministic 4xx errors fail immediately without retrying.
     """
     payload = {
         "model": model_name,
@@ -393,7 +527,7 @@ async def _chat_completion_async(
                 f"{base_url}/v1/chat/completions",
                 json=payload,
                 headers={"Authorization": "Bearer no-key"},
-                timeout=aiohttp.ClientTimeout(total=120),
+                timeout=aiohttp.ClientTimeout(total=request_timeout),
             ) as resp:
                 result = await resp.json(content_type=None)
                 content = result["choices"][0]["message"]["content"]
@@ -415,19 +549,21 @@ async def _chat_completion_async(
                 )
                 break  # Success
 
-        except aiohttp.ClientResponseError as exc:
-            last_error = f"HTTP {exc.status}: {exc.message}"
-            logger.error("Chat completion request failed (attempt %d/%d): %s", attempt, _MAX_CHAT_RETRIES, last_error)
-            with _print_lock:
-                print(f"  Chat completion request failed (attempt {attempt}/{_MAX_CHAT_RETRIES}): {last_error}")
         except Exception as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
+            if isinstance(exc, aiohttp.ClientResponseError):
+                last_error = f"HTTP {exc.status}: {exc.message}"
+            else:
+                last_error = f"{type(exc).__name__}: {exc}"
             logger.error("Chat completion request failed (attempt %d/%d): %s", attempt, _MAX_CHAT_RETRIES, last_error)
             with _print_lock:
                 print(f"  Chat completion request failed (attempt {attempt}/{_MAX_CHAT_RETRIES}): {last_error}")
 
+            if not _is_transient_error(exc):
+                logger.error("Error is not transient - not retrying")
+                break
+
         # Retry with exponential backoff (skip sleep on last attempt).
-        # Requests can take 16–30 s, so we need wide spacing so later
+        # Requests can take 16-30 s, so we need wide spacing so later
         # attempts land after the first batch frees its slots.
         if attempt < _MAX_CHAT_RETRIES:
             backoff = min(3 * (2 ** (attempt - 1)), 30)  # 3s, 6s, 12s, 24s (capped 30s)
@@ -455,6 +591,7 @@ def _batch_chat_completions(
     prompts: list[tuple[int, str]],
     *,
     max_concurrent: int | None = None,
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
 ) -> list[tuple[int, ChatResult]]:
     """Send multiple chat completion requests concurrently using aiohttp.
 
@@ -467,6 +604,7 @@ def _batch_chat_completions(
         system_prompt: Shared system prompt for all requests.
         prompts: List of (original_index, user_prompt) tuples.
         max_concurrent: Max simultaneous requests. Defaults to len(prompts).
+        request_timeout: Seconds to wait for a single request before retrying.
 
     Returns:
         List of (original_index, ChatResult) tuples, ordered by index.
@@ -481,7 +619,8 @@ def _batch_chat_completions(
         async def _semapped(idx: int, prompt: str) -> tuple[int, ChatResult]:
             async with semaphore:
                 return await _chat_completion_async(
-                    session, base_url, model_name, system_prompt, prompt, idx
+                    session, base_url, model_name, system_prompt, prompt, idx,
+                    request_timeout=request_timeout,
                 )
 
         async with aiohttp.ClientSession(connector=connector) as session:
@@ -497,11 +636,13 @@ def enhance_prompt(
     system_prompt: str,
     user_prompt: str,
     extra_flags: str = "",
+    *,
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
 ) -> ChatResult:
     """Enhance a prompt by spawning a temporary llama-server instance.
 
     1. Find a free port by probing the ephemeral range.
-    2. Start llama-server on that port.
+    2. Start llama-server on that port (output pipes drained continuously).
     3. Wait for /health to confirm the server is ready.
     4. Send the prompt via /v1/chat/completions.
     5. Kill the server.
@@ -512,28 +653,11 @@ def enhance_prompt(
         return ChatResult()
 
     port = _find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    cmd = _build_command(server_path, model_path, port, extra_flags)
-
-    logger.info("llama-server command: %s", " ".join(cmd))
     logger.info("llama-server user prompt: %s", user_prompt)
     print(f"\n  Running llama-server (model: {Path(model_path).name}, port: {port})...")
 
-    # Windows: prevent console window popup
-    creationflags = 0
-    if sys.platform == "win32":
-        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
-
-    server_proc: subprocess.Popen | None = None
     try:
-        server_proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            creationflags=creationflags,
-        )
-        logger.info("llama-server started (pid=%s, port=%s)", server_proc.pid, port)
-        print(f"  Started llama-server (pid={server_proc.pid}, port={port})")
+        sp = spawn_server(server_path, model_path, port, extra_flags)
     except FileNotFoundError:
         logger.error("llama-server not found at: %s", server_path)
         print(f"  FAILED: llama-server not found at: {server_path}")
@@ -546,37 +670,38 @@ def enhance_prompt(
     print(f"  Waiting for server to start (timeout: {_SERVER_STARTUP_TIMEOUT}s)...")
     start = time.monotonic()
 
-    if not _wait_for_server(base_url, timeout=_SERVER_STARTUP_TIMEOUT):
+    if not _wait_for_server(sp.base_url, timeout=_SERVER_STARTUP_TIMEOUT, proc=sp.proc):
         elapsed = time.monotonic() - start
         print(f"  FAILED: Server did not become healthy within {_SERVER_STARTUP_TIMEOUT}s ({elapsed:.1f}s elapsed)")
         logger.error("Server did not become healthy within %ds", _SERVER_STARTUP_TIMEOUT)
-
-        # Check if the process crashed and log stderr
-        if server_proc.poll() is not None:
-            stderr = server_proc.stderr.read().decode("utf-8", errors="replace") if server_proc.stderr else ""
-            logger.error("Server process exited (code=%s). Stderr:\n%s", server_proc.returncode, stderr[-1000:])
-        _kill_server(server_proc)
+        stderr_tail = sp.stderr_tail(2000)
+        if stderr_tail.strip():
+            logger.error("Server stderr (last 2000 chars):\n%s", stderr_tail)
+        _kill_server(sp)
         return ChatResult()
 
     ready_time = time.monotonic()
 
     # Discover the loaded model name
-    model_name = _discover_model_name(base_url)
+    model_name = _discover_model_name(sp.base_url)
     logger.info("Discovered model: %s", model_name)
     print(f"  Server ready on port {port} in {ready_time - start:.1f}s. Model: {model_name}")
 
-    # Warm up the chat endpoint — /health returns 200 before the chat handler
+    # Warm up the chat endpoint - /health returns 200 before the chat handler
     # and parallel KV slots are fully initialized. Without this, the first real
     # request can get HTTP 400 (especially with --parallel N --no-kv-unified).
-    _warmup_chat_endpoint(base_url, model_name, num_slots=1)
+    _warmup_chat_endpoint(sp.base_url, model_name, num_slots=1)
 
     # Send the chat completion request
-    result = _chat_completion(base_url, model_name, system_prompt, user_prompt)
+    result = _chat_completion(
+        sp.base_url, model_name, system_prompt, user_prompt,
+        request_timeout=request_timeout,
+    )
 
     elapsed = time.monotonic() - ready_time
 
     # Always kill the server
-    _kill_server(server_proc)
+    _kill_server(sp)
 
     if result.content:
         logger.info("Enhanced prompt (%d chars): %s", len(result.content), result.content)
@@ -589,35 +714,32 @@ def enhance_prompt(
         logger.warning("Empty or failed response from server")
         print(f"  FAILED: empty or invalid response ({elapsed:.1f}s)")
         # Capture server stderr for diagnostics
-        if server_proc and server_proc.stderr:
-            try:
-                stderr_output = server_proc.stderr.read().decode("utf-8", errors="replace")
-                if stderr_output.strip():
-                    logger.warning("Server stderr:\n%s", stderr_output[-2000:])
-            except Exception:
-                pass
+        stderr_tail = sp.stderr_tail(2000)
+        if stderr_tail.strip():
+            logger.warning("Server stderr:\n%s", stderr_tail)
 
     return result
 
 
-def _kill_server(proc: subprocess.Popen | None):
-    """Terminate the server subprocess and wait for it to exit."""
-    if proc is None:
+def _kill_server(sp: _ServerProcess | None):
+    """Terminate the server subprocess, then stop the output drainers."""
+    if sp is None:
         return
 
-    pid = proc.pid
+    pid = sp.pid
     logger.info("Killing llama-server (pid=%s)...", pid)
     print(f"  Killing llama-server (pid={pid})...")
     try:
-        proc.terminate()
+        sp.proc.terminate()
         try:
-            proc.wait(timeout=5)
+            sp.proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             logger.warning("llama-server (pid=%s) did not terminate, sending SIGKILL", pid)
-            proc.kill()
-            proc.wait(timeout=3)
+            sp.proc.kill()
+            sp.proc.wait(timeout=3)
     except Exception:
         logger.exception("Error stopping llama-server")
     finally:
+        sp.stop_drainers()
         logger.info("llama-server (pid=%s) stopped.", pid)
         print(f"  llama-server (pid={pid}) stopped.")
