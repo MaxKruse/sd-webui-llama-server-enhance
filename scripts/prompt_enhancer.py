@@ -6,6 +6,7 @@ This file was modified with the assistance of an LLM.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -39,17 +40,40 @@ logger = logging.getLogger(__name__)
 # Resolve the extensions directory relative to this file
 _EXTENSIONS_DIR = Path(__file__).resolve().parent.parent.parent.parent
 
-# Log file for debugging — written to the extension root so it's easy to find
+# Log file for debugging - written to the extension root so it's easy to find
 _LOG_DIR = Path(__file__).resolve().parent.parent
 _LOG_FILE = _LOG_DIR / "enhance_debug.log"
+_LOG_BACKUP = _LOG_FILE.with_name("enhance_debug.log.1")
+
+# Rotate the debug log once it grows past this size (bytes).
+_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+# Guards the log file against concurrent writers (main thread + pipe drainer).
+_LOG_LOCK = threading.Lock()
+
+# Guards the UI "Test server" button against concurrent runs.
+_TEST_LOCK = threading.Lock()
+
+
+def _rotate_log_if_needed():
+    """Rotate the debug log to enhance_debug.log.1 once it passes the size limit."""
+    try:
+        if _LOG_FILE.exists() and _LOG_FILE.stat().st_size > _LOG_MAX_BYTES:
+            if _LOG_BACKUP.exists():
+                _LOG_BACKUP.unlink()
+            _LOG_FILE.rename(_LOG_BACKUP)
+    except OSError:
+        logger.warning("Could not rotate debug log", exc_info=True)
 
 
 def _log_to_file(msg: str):
-    """Append a timestamped message to the debug log file."""
+    """Append a timestamped message to the debug log file (thread-safe)."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     line = f"[{timestamp}] {msg}\n"
-    with open(_LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(line)
+    with _LOG_LOCK:
+        _rotate_log_if_needed()
+        with open(_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
 
 
 def _read_request_timeout() -> float:
