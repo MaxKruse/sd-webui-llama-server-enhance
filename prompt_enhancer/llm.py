@@ -639,6 +639,51 @@ def _batch_chat_completions(
     return asyncio.run(_run())
 
 
+def chat_completion_request(
+    sp: _ServerProcess,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+    label: str = "Enhanced prompt",
+) -> ChatResult:
+    """Discover the model, warm up the chat endpoint, and send one chat
+    completion against an already-running server.
+
+    The caller owns the server lifecycle (spawn_server / _kill_server), so
+    several prompts can share a single model load.
+    """
+    # Discover the loaded model name
+    model_name = _discover_model_name(sp.base_url)
+    logger.info("Discovered model: %s", model_name)
+
+    # Warm up the chat endpoint - /health returns 200 before the chat handler
+    # and parallel KV slots are fully initialized. Without this, the first real
+    # request can get HTTP 400 (especially with --parallel N --no-kv-unified).
+    _warmup_chat_endpoint(sp.base_url, model_name, num_slots=1)
+
+    logger.info("llama-server user prompt: %s", user_prompt)
+    result = _chat_completion(
+        sp.base_url, model_name, system_prompt, user_prompt,
+        request_timeout=request_timeout,
+    )
+
+    if result.content:
+        logger.info("%s (%d chars): %s", label, len(result.content), result.content)
+        print(
+            f"  Result ({len(result.content)} chars, {result.completion_tokens} tokens, "
+            f"{result.generation_tps:.1f} tok/s, {result.total_ms:.0f}ms total): "
+            f"{result.content[:200]}{'...' if len(result.content) > 200 else ''}"
+        )
+    else:
+        logger.warning("Empty or failed response from server")
+        stderr_tail = sp.stderr_tail(2000)
+        if stderr_tail.strip():
+            logger.warning("Server stderr:\n%s", stderr_tail)
+
+    return result
+
+
 def enhance_prompt(
     server_path: str,
     model_path: str,
@@ -690,43 +735,14 @@ def enhance_prompt(
         return ChatResult()
 
     ready_time = time.monotonic()
+    print(f"  Server ready on port {port} in {ready_time - start:.1f}s.")
 
-    # Discover the loaded model name
-    model_name = _discover_model_name(sp.base_url)
-    logger.info("Discovered model: %s", model_name)
-    print(f"  Server ready on port {port} in {ready_time - start:.1f}s. Model: {model_name}")
-
-    # Warm up the chat endpoint - /health returns 200 before the chat handler
-    # and parallel KV slots are fully initialized. Without this, the first real
-    # request can get HTTP 400 (especially with --parallel N --no-kv-unified).
-    _warmup_chat_endpoint(sp.base_url, model_name, num_slots=1)
-
-    # Send the chat completion request
-    result = _chat_completion(
-        sp.base_url, model_name, system_prompt, user_prompt,
-        request_timeout=request_timeout,
+    result = chat_completion_request(
+        sp, system_prompt, user_prompt, request_timeout=request_timeout,
     )
-
-    elapsed = time.monotonic() - ready_time
 
     # Always kill the server
     _kill_server(sp)
-
-    if result.content:
-        logger.info("Enhanced prompt (%d chars): %s", len(result.content), result.content)
-        print(
-            f"  Result ({len(result.content)} chars, {result.completion_tokens} tokens, "
-            f"{result.generation_tps:.1f} tok/s, {result.total_ms:.0f}ms total, {elapsed:.1f}s wall): "
-            f"{result.content[:200]}{'...' if len(result.content) > 200 else ''}"
-        )
-    else:
-        logger.warning("Empty or failed response from server")
-        print(f"  FAILED: empty or invalid response ({elapsed:.1f}s)")
-        # Capture server stderr for diagnostics
-        stderr_tail = sp.stderr_tail(2000)
-        if stderr_tail.strip():
-            logger.warning("Server stderr:\n%s", stderr_tail)
-
     return result
 
 

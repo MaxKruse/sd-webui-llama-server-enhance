@@ -31,6 +31,7 @@ from prompt_enhancer.llm import (
     _warmup_chat_endpoint,
     _batch_chat_completions,
     _kill_server,
+    chat_completion_request,
     spawn_server,
     enhance_prompt,
 )
@@ -611,7 +612,9 @@ class LlamaServerEnhance(scripts.Script):
 
         extra_flags = shared.opts.llama_enhance_extra_flags or ""
         request_timeout = _read_request_timeout()
-        # "Once" mode: enhance a single prompt and apply to all images
+        # "Once" mode: enhance a single prompt and apply to all images.
+        # One shared server serves both the positive and negative requests,
+        # so the model is loaded only once.
         if enhance_mode == "Once":
             original = p.all_prompts[0] if p.all_prompts else ""
             if not original.strip():
@@ -620,71 +623,72 @@ class LlamaServerEnhance(scripts.Script):
 
             original_negative = p.all_negative_prompts[0] if p.all_negative_prompts else ""
 
-            # Step 1: Enhance positive prompt
-            _log_to_file(f"  → Once mode: enhancing positive ({len(original)} chars)")
-            pos_result: ChatResult = enhance_prompt(
-                server_path=server_path,
-                model_path=model_path,
-                system_prompt=system_prompt,
-                user_prompt=original,
-                extra_flags=extra_flags,
-                request_timeout=request_timeout,
-            )
-
-            if not pos_result.content:
-                _log_to_file("  → Once mode: positive enhancement failed, keeping original")
-                logger.info("Using original prompt (enhancement failed)")
-                print("  Using original prompt (enhancement failed)")
+            sp = _spawn_healthy_server(server_path, model_path, extra_flags)
+            if sp is None:
                 _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
                 _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
                 return
 
-            enhanced_positive = pos_result.content
-
-            # Escape accidental DP syntax in the enhanced prompt
-            enhanced_positive = _escape_accidental_dp_syntax(original, enhanced_positive)
-
-            _log_to_file(
-                f"  → Once mode: positive enhanced ({len(enhanced_positive)} chars, "
-                f"{pos_result.completion_tokens} tokens, {pos_result.generation_tps:.1f} tok/s, "
-                f"{pos_result.total_ms:.0f}ms total)"
-            )
-            print(f"  Enhanced prompt (full): {enhanced_positive}")
-
-            # Step 2: Enhance negative prompt (if enabled)
-            enhanced_negative = original_negative
-            if enhance_negative:
-                _log_to_file(f"  → Once mode: enhancing negative ({len(original_negative)} chars)")
-                neg_user_prompt = _build_negative_user_prompt(enhanced_positive, original_negative)
-                neg_result: ChatResult = enhance_prompt(
-                    server_path=server_path,
-                    model_path=model_path,
-                    system_prompt=negative_system_prompt,
-                    user_prompt=neg_user_prompt,
-                    extra_flags=extra_flags,
+            try:
+                # Step 1: Enhance positive prompt
+                _log_to_file(f"  → Once mode: enhancing positive ({len(original)} chars)")
+                pos_result: ChatResult = chat_completion_request(
+                    sp, system_prompt, original,
                     request_timeout=request_timeout,
                 )
 
-                if neg_result.content:
-                    enhanced_negative = neg_result.content
+                if not pos_result.content:
+                    _log_to_file("  → Once mode: positive enhancement failed, keeping original")
+                    logger.info("Using original prompt (enhancement failed)")
+                    print("  Using original prompt (enhancement failed)")
+                    _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
+                    _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
+                    return
 
-                    # Escape accidental DP syntax in the enhanced negative prompt
-                    enhanced_negative = _escape_accidental_dp_syntax(original_negative, enhanced_negative)
+                enhanced_positive = pos_result.content
 
-                    _log_to_file(
-                        f"  → Once mode: negative enhanced ({len(enhanced_negative)} chars, "
-                        f"{neg_result.completion_tokens} tokens, {neg_result.generation_tps:.1f} tok/s, "
-                        f"{neg_result.total_ms:.0f}ms total)"
+                # Escape accidental DP syntax in the enhanced prompt
+                enhanced_positive = _escape_accidental_dp_syntax(original, enhanced_positive)
+
+                _log_to_file(
+                    f"  → Once mode: positive enhanced ({len(enhanced_positive)} chars, "
+                    f"{pos_result.completion_tokens} tokens, {pos_result.generation_tps:.1f} tok/s, "
+                    f"{pos_result.total_ms:.0f}ms total)"
+                )
+                print(f"  Enhanced prompt (full): {enhanced_positive}")
+
+                # Step 2: Enhance negative prompt (if enabled)
+                enhanced_negative = original_negative
+                if enhance_negative:
+                    _log_to_file(f"  → Once mode: enhancing negative ({len(original_negative)} chars)")
+                    neg_user_prompt = _build_negative_user_prompt(enhanced_positive, original_negative)
+                    neg_result: ChatResult = chat_completion_request(
+                        sp, negative_system_prompt, neg_user_prompt,
+                        request_timeout=request_timeout,
+                        label="Enhanced negative prompt",
                     )
-                    print(f"  Enhanced negative (full): {enhanced_negative}")
 
-            p.all_prompts = [enhanced_positive] * len(p.all_prompts)
-            p.all_negative_prompts = [enhanced_negative] * len(p.all_negative_prompts)
-            logger.info("Prompt enhanced (Once mode): %s → %s", original[:60], enhanced_positive[:60])
-            logger.info("Negative: %s → %s", original_negative[:60], enhanced_negative[:60])
-            _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
-            _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
-            return
+                    if neg_result.content:
+                        enhanced_negative = neg_result.content
+
+                        # Escape accidental DP syntax in the enhanced negative prompt
+                        enhanced_negative = _escape_accidental_dp_syntax(original_negative, enhanced_negative)
+
+                        _log_to_file(
+                            f"  → Once mode: negative enhanced ({len(enhanced_negative)} chars, "
+                            f"{neg_result.completion_tokens} tokens, {neg_result.generation_tps:.1f} tok/s, "
+                            f"{neg_result.total_ms:.0f}ms total)"
+                        )
+                        print(f"  Enhanced negative (full): {enhanced_negative}")
+
+                p.all_prompts = [enhanced_positive] * len(p.all_prompts)
+                p.all_negative_prompts = [enhanced_negative] * len(p.all_negative_prompts)
+                logger.info("Prompt enhanced (Once mode): %s → %s", original[:60], enhanced_positive[:60])
+                logger.info("Negative: %s → %s", original_negative[:60], enhanced_negative[:60])
+                _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
+                _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
+            finally:
+                _kill_server(sp)
 
         # "Per image" mode: start ONE server, batch positives, then batch negatives
         _log_to_file(f"  → Per image mode: {len(p.all_prompts)} prompt(s)")
