@@ -6,6 +6,7 @@ This file was modified with the assistance of an LLM.
 from __future__ import annotations
 
 import logging
+import shutil
 import threading
 import time
 from datetime import datetime
@@ -529,7 +530,106 @@ class LlamaServerEnhance(scripts.Script):
                 elem_id=self.elem_id("enhance-negative"),
             )
 
+            test_button = gr.Button("Test server", variant="secondary")
+            test_output = gr.Textbox(
+                label="Test result",
+                interactive=False,
+                lines=6,
+                elem_id=self.elem_id("test-result"),
+            )
+            test_button.click(fn=self._test_server, outputs=[test_output])
+
         return [enable, enhance_mode, enhance_negative]
+
+    def _test_server(self) -> str:
+        """UI button handler: validate the configured server without generating."""
+        _log_to_file("=" * 72)
+        _log_to_file("Test server requested from UI")
+
+        if getattr(shared.state, "job", ""):
+            msg = "A generation is in progress - please wait for it to finish before testing."
+            _log_to_file(f"  → {msg}")
+            return msg
+
+        if not _TEST_LOCK.acquire(blocking=False):
+            msg = "A server test is already running - please wait for it to finish."
+            _log_to_file(f"  → {msg}")
+            return msg
+
+        try:
+            return self._run_server_test()
+        except Exception as exc:
+            logger.exception("Server test failed")
+            _log_to_file(f"  → test crashed: {exc}")
+            return f"FAILED: unexpected error: {exc}"
+        finally:
+            _TEST_LOCK.release()
+
+    def _run_server_test(self) -> str:
+        """Check binary + model, then run a live spawn/health/chat test."""
+        server_path = shared.opts.llama_enhance_server_path or "llama-server"
+        model_path = shared.opts.llama_enhance_model_path or ""
+        extra_flags = shared.opts.llama_enhance_extra_flags or ""
+
+        lines: list[str] = []
+
+        # 1. Binary check
+        binary = str(Path(server_path).resolve()) if Path(server_path).is_file() else shutil.which(server_path)
+        if not binary:
+            msg = f"Binary: FAILED - {server_path!r} not found. Set 'llama-server path' in Settings -> LLama Server Enhance."
+            _log_to_file(f"  → {msg}")
+            return msg
+        lines.append(f"Binary: OK ({binary})")
+        _log_to_file(f"  binary: {binary}")
+
+        # 2. Model file check
+        if not model_path or not Path(model_path).is_file():
+            msg = f"Model: FAILED - {model_path or '<not set>'!r} not found. Set 'Model path' in Settings -> LLama Server Enhance."
+            _log_to_file(f"  → {msg}")
+            return "\n".join([*lines, msg])
+        lines.append(f"Model: OK ({Path(model_path).name})")
+        _log_to_file(f"  model: {model_path}")
+
+        # 3. Live test: spawn, health check, small chat request
+        _log_to_file("  → live test: starting server")
+        _free_gpu_memory()
+        sp = _spawn_healthy_server(server_path, model_path, extra_flags, label=" (test)")
+        if sp is None:
+            msg = "Server: FAILED - did not become healthy. See enhance_debug.log for the server's stderr."
+            _log_to_file(f"  → {msg}")
+            return "\n".join([*lines, msg])
+
+        try:
+            self._test_chat(sp, lines)
+        finally:
+            _kill_server(sp)
+
+        return "\n".join(lines)
+
+    def _test_chat(self, sp: _ServerProcess, lines: list[str]) -> None:
+        """Run one small chat request against a healthy server, appending results."""
+        model_name = _discover_model_name(sp.base_url)
+        lines.append(f"Server: OK (model id: {model_name})")
+        _log_to_file(f"  model id: {model_name}")
+
+        t0 = time.monotonic()
+        result = chat_completion_request(
+            sp,
+            "Reply with exactly one word: OK",
+            "ping",
+            request_timeout=_read_request_timeout(),
+            label="Test reply",
+        )
+        elapsed = time.monotonic() - t0
+        if result.content:
+            lines.append(
+                f"Chat: OK ({elapsed:.1f}s, {result.completion_tokens} tokens, "
+                f"{result.generation_tps:.1f} tok/s, reply: {result.content[:80]!r})"
+            )
+            _log_to_file(f"  chat OK in {elapsed:.1f}s: {result.content[:200]!r}")
+        else:
+            lines.append(f"Chat: FAILED - {result.error}")
+            _log_to_file(f"  → chat failed: {result.error}")
 
     def process(
         self,
