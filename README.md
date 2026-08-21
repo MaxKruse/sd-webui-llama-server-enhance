@@ -38,6 +38,7 @@ All settings are in **Settings -> LLama Server Enhance**:
 | **llama-server path** | Path to the `llama-server` binary (default: `llama-server` from PATH) |
 | **Model path** | Full path to your `.gguf` model file |
 | **Inference flags** | Extra flags passed to `llama-server` (e.g., `-ngl 99 --temp 0.8 --top-p 0.9`) |
+| **Request timeout** | Seconds to wait for a single LLM request before retrying (default: `120`) |
 
 ## Presets
 
@@ -121,6 +122,12 @@ This ensures the LLM can freely describe things like "a cat or dog" without the 
 
 This avoids the Nxstartup penalty of spawning a new server per prompt.
 
+### Reliability details
+
+- **Pipe draining** - the server's stdout/stderr are continuously drained by background threads into bounded in-memory buffers (last 256KB kept). Without draining, the OS pipe buffer (4KB on Windows) fills up as the server logs its startup and every task, and the server's own threads block on write: `/health` keeps answering while chat requests hang. This was the root cause of intermittent "server is healthy but times out" behavior.
+- **Transient-only retries** - failed requests are retried up to 5 times (3s/6s/12s/24s backoff), but only for transient errors (timeouts, connection failures, HTTP 408/429/5xx, truncated responses). Deterministic 4xx errors (e.g., context overflow) fail immediately instead of burning ~45s of retries.
+- **Per-request timeout** - each chat request times out after the configured *Request timeout* (default 120s), not after the whole retry budget.
+
 ## Test Script
 
 A standalone test script is included for validating your setup:
@@ -143,11 +150,14 @@ python test_llm.py --mode batch --preset anima --model C:/models/my-model.gguf \
 # Custom server path + inference flags
 python test_llm.py --server C:/tools/llamacpp/llama-server.exe \
     --preset anima --model C:/models/my-model.gguf --flags "-ngl 99 --temp 0.5"
+
+# Override the per-request timeout (seconds)
+python test_llm.py --preset anima --model C:/models/my-model.gguf --timeout 60
 ```
 
 ## Debugging
 
-A debug log is written to `enhance_debug.log` in the extension root directory. It records every step of the enhancement pipeline with timestamps.
+A debug log is written to `enhance_debug.log` in the extension root directory. It records every step of the enhancement pipeline with timestamps. On failure it also captures the last 3000 characters of the server's stderr (model load errors, OOM, etc.). Note: the log grows unbounded - delete it periodically if it gets large.
 
 ## Requirements
 
