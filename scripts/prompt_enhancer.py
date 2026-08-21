@@ -390,13 +390,12 @@ def _effective_negative_system_prompt(
         preset_content,
         width=width,
         height=height,
-        hires=hires,
         base_width=base_width,
         base_height=base_height,
     ) + _build_negative_prompt_instruction()
 
 
-class Script(scripts.Script):
+class LlamaServerEnhance(scripts.Script):
     """Enhance positive prompts through a local LLM (llama-server)."""
 
     # Run BEFORE sd-dynamic-prompts (priority 1000) so we enhance the raw
