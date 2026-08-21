@@ -37,6 +37,14 @@ def on_ui_settings():
         ),
     )
     shared.opts.add_option(
+        key="llama_enhance_startup_timeout",
+        info=shared.OptionInfo(
+            60,
+            label="Server startup timeout: Seconds to wait for llama-server to load the model and become healthy (default: 60)",
+            section=section,
+        ),
+    )
+    shared.opts.add_option(
         key="llama_enhance_extra_flags",
         info=shared.OptionInfo(
             "",
