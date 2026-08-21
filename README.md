@@ -13,6 +13,7 @@ Drop this extension into your `extensions/` folder and get per-image prompt enha
 - **Two enhancement modes**:
   - **Per image** - enhance each prompt individually (batch-optimized: one server, parallel requests)
   - **Once** - enhance one prompt and apply it to all images in the batch
+- **Test server button** - in the UI accordion: validates the binary, model file, and inference flags with a live spawn + health check + small chat request, without generating anything
 - **OpenAI-compatible API** - works with any model that `llama-server` can load
 
 ## Installation
@@ -39,6 +40,7 @@ All settings are in **Settings -> LLama Server Enhance**:
 | **Model path** | Full path to your `.gguf` model file |
 | **Inference flags** | Extra flags passed to `llama-server` (e.g., `-ngl 99 --temp 0.8 --top-p 0.9`) |
 | **Request timeout** | Seconds to wait for a single LLM request before retrying (default: `120`) |
+| **Server startup timeout** | Seconds to wait for `llama-server` to load the model and become healthy (default: `60`) |
 
 ## Presets
 
@@ -67,7 +69,7 @@ Each prompt in the batch is enhanced individually. The extension starts **one** 
 
 ### Once
 
-Enhances only the first prompt and applies the result to all images in the batch. Useful for grid generation or when you want consistent enhancement across all outputs.
+Enhances only the first prompt and applies the result to all images in the batch. Useful for grid generation or when you want consistent enhancement across all outputs. The positive and negative requests share **one** server instance, so the model is loaded only once.
 
 ## Resolution Awareness
 
@@ -107,8 +109,8 @@ This ensures the LLM can freely describe things like "a cat or dog" without the 
 
 1. Find a free TCP port in the ephemeral range (49152-65535)
 2. Start `llama-server` on that port with `--no-ui --no-warmup`
-3. Poll `/health` until the model is loaded and ready (60s timeout, aborts early if the process exits)
-4. Send the prompt via `/v1/chat/completions`
+3. Poll `/health` until the model is loaded and ready (configurable startup timeout, default 60s, aborts early if the process exits)
+4. Send the positive prompt - and the negative prompt too, if enabled - via `/v1/chat/completions`, both against the same server
 5. Kill the server process
 
 ### Batch (Per image mode)
@@ -157,7 +159,7 @@ python test_llm.py --preset anima --model C:/models/my-model.gguf --timeout 60
 
 ## Debugging
 
-A debug log is written to `enhance_debug.log` in the extension root directory. It records every step of the enhancement pipeline with timestamps. On failure it also captures the last 3000 characters of the server's stderr (model load errors, OOM, etc.). Note: the log grows unbounded - delete it periodically if it gets large.
+A debug log is written to `enhance_debug.log` in the extension root directory. It records every step of the enhancement pipeline with timestamps, plus the server's own stderr streamed live as `[llama-server]` lines - model load progress, per-task logs, OOM errors. On failure it also captures the last 3000 characters of the server's stderr. The log rotates to `enhance_debug.log.1` automatically once it exceeds 5MB (one backup generation is kept).
 
 ## Requirements
 
