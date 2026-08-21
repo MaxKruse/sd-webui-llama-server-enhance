@@ -52,14 +52,31 @@ def _log_to_file(msg: str):
         f.write(line)
 
 
-def _free_gpu_memory():
-    """Unload all SD models from GPU to free VRAM for llama-server."""
-    from backend import memory_management
+def _read_request_timeout() -> float:
+    """Read the per-request LLM timeout from settings (seconds)."""
+    try:
+        return float(getattr(shared.opts, "llama_enhance_timeout", 120) or 120)
+    except (TypeError, ValueError):
+        logger.warning("Invalid llama_enhance_timeout value - falling back to 120s")
+        return 120.0
 
-    memory_management.unload_all_models()
-    memory_management.soft_empty_cache(force=True)
-    gc.collect()
-    _log_to_file("  GPU memory freed for llama-server")
+
+def _free_gpu_memory():
+    """Unload all SD models from GPU to free VRAM for llama-server.
+
+    Best-effort: the backend module is Forge-specific, so on other WebUI forks
+    this logs a warning instead of crashing the whole generation.
+    """
+    try:
+        from backend import memory_management
+
+        memory_management.unload_all_models()
+        memory_management.soft_empty_cache(force=True)
+        gc.collect()
+        _log_to_file("  GPU memory freed for llama-server")
+    except Exception:
+        logger.warning("Could not unload SD models from GPU (non-Forge install?)", exc_info=True)
+        _log_to_file("  WARNING: could not free GPU memory (backend module unavailable)")
 
 
 def _dynamic_prompts_installed() -> bool:
