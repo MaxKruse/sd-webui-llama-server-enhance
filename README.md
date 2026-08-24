@@ -11,7 +11,7 @@ Drop this extension into your `extensions/` folder and get per-image prompt enha
 - **Hires fix aware** - provides the LLM with final output dimensions (after hires fix upscaling) so it can frame compositions appropriately
 - **Dynamic Prompts integration** - automatically escapes accidental DP syntax in LLM output; supports custom DP separators (configurable `variant_start`, `variant_end`, `wildcard_wrap`). See [Dynamic Prompts Integration](#dynamic-prompts-integration) for execution order
 - **Two enhancement modes**:
-  - **Per image** - enhance each prompt individually (batch-optimized: one server, parallel requests)
+  - **Per image** - enhance each prompt individually (batch-optimized: one server, strict buckets of the server's slot count, cross-bucket variation so similar prompts don't clone)
   - **Once** - enhance one prompt and apply it to all images in the batch
 - **Test server button** - in the UI accordion: validates the binary, model file, and inference flags with a live spawn + health check + small chat request, without generating anything
 - **OpenAI-compatible API** - works with any model that `llama-server` can load
@@ -65,7 +65,7 @@ Included presets:
 
 ### Per image (default)
 
-Each prompt in the batch is enhanced individually. The extension starts **one** `llama-server` instance and sends all prompts concurrently, then collects all responses before returning. This leverages the server's ability to run parallel inference workflows.
+Each prompt in the batch is enhanced individually. The extension starts **one** `llama-server` instance and sends the positive prompts in **strict buckets** sized to the server's parallel slot count (e.g. 4 concurrent): a whole bucket must finish before the next bucket starts. When more than one bucket runs, each bucket after the first receives the previous bucket's prompts (the enhanced text actually used, or the original after a failure) as a *variation reference* - the LLM is instructed not to repeat them exactly and to introduce fresh variance (mood, lighting, environment, pose, composition) while staying faithful to your original intent. This keeps large batches of similar prompts from collapsing into near-identical images. Negative prompts are batched the same way, without variation references.
 
 ### Once
 
@@ -117,12 +117,13 @@ This ensures the LLM can freely describe things like "a cat or dog" without the 
 
 1. Find a free TCP port
 2. Start **one** `llama-server` instance
-3. Wait for `/health` (once)
-4. Send **all prompts concurrently** via thread pool
-5. Collect all responses
-6. Kill the server
+3. Wait for `/health` (once), discover the slot count via `/slots`, warm up the chat endpoint
+4. Send the positive prompts in **strict buckets** of the slot count - each bucket finishes before the next starts
+5. Each bucket after the first gets the previous bucket's prompts appended to the system prompt as a "do not repeat exactly, introduce variance" reference
+6. Batch the negative prompts (if enabled), same bucketing, no variation reference
+7. Kill the server
 
-This avoids the Nxstartup penalty of spawning a new server per prompt.
+This avoids the Nxstartup penalty of spawning a new server per prompt, and the bucketing keeps multi-bucket jobs varied instead of repetitive.
 
 ### Reliability details
 
@@ -141,9 +142,13 @@ python test_llm.py --preset anima --model C:/models/my-model.gguf --dry-run
 # Single prompt test
 python test_llm.py --preset anima --model C:/models/my-model.gguf --prompt "a cat"
 
-# Batch test - multiple prompts, parallel inference
+# Batch test - multiple prompts, sent in buckets (cross-bucket variation enabled)
 python test_llm.py --mode batch --preset anima --model C:/models/my-model.gguf \
     --prompts "a cat on a windowsill" "sunset over mountains" "cyberpunk city street"
+
+# Batch test with a fixed bucket size (default: the server's parallel slot count)
+python test_llm.py --mode batch --preset anima --model C:/models/my-model.gguf \
+    --concurrency 2 --prompts "p1" "p2" "p3" "p4"
 
 # Batch test from file (one prompt per line)
 python test_llm.py --mode batch --preset anima --model C:/models/my-model.gguf \

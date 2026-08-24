@@ -538,6 +538,7 @@ async def _chat_completion_async(
                 headers={"Authorization": "Bearer no-key"},
                 timeout=aiohttp.ClientTimeout(total=request_timeout),
             ) as resp:
+                resp.raise_for_status()
                 result = await resp.json(content_type=None)
                 content = result["choices"][0]["message"]["content"]
 
@@ -580,6 +581,8 @@ async def _chat_completion_async(
             with _print_lock:
                 print(f"  Retrying in {backoff:.0f}s...")
             await asyncio.sleep(backoff)
+    if not chat_result.content:
+        chat_result.error = last_error or "all retries failed"
 
     # Final status print
     with _print_lock:
@@ -593,6 +596,33 @@ async def _chat_completion_async(
     return index, chat_result
 
 
+def _plan_buckets(prompts: list[tuple[int, str]], bucket_size: int) -> list[list[tuple[int, str]]]:
+    """Split prompts into consecutive buckets of bucket_size (last may be shorter)."""
+    bucket_size = max(1, bucket_size)
+    return [prompts[i:i + bucket_size] for i in range(0, len(prompts), bucket_size)]
+
+
+def _variation_reference_block(previous_texts: list[str]) -> str:
+    """Build the system-prompt addendum that references the previous bucket's prompts.
+
+    The LLM sees what the previous bucket already produced, so it can vary
+    mood, lighting, environment, pose, and composition instead of repeating
+    the same scene. Whitespace is collapsed so each reference stays on one
+    numbered line.
+    """
+    numbered = "\n".join(
+        f"{n}. {' '.join(text.split())}" for n, text in enumerate(previous_texts, start=1)
+    )
+    return (
+        "\n\n## Previous Batch Reference\n"
+        "The following prompts were already enhanced and generated in the immediately preceding batch of this job:\n"
+        f"{numbered}\n"
+        "Do not repeat any of them exactly, and avoid near-duplicates of their mood, lighting, "
+        "environment, pose, action, and composition. Introduce fresh variation while staying "
+        "faithful to the user's original intent in the current request."
+    )
+
+
 def _batch_chat_completions(
     base_url: str,
     model_name: str,
@@ -601,40 +631,67 @@ def _batch_chat_completions(
     *,
     max_concurrent: int | None = None,
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+    vary_across_buckets: bool = False,
 ) -> list[tuple[int, ChatResult]]:
     """Send multiple chat completion requests concurrently using aiohttp.
 
-    Uses asyncio + aiohttp for true concurrent HTTP I/O (no GIL blocking).
-    Limits concurrent in-flight requests to max_concurrent (default: server slot count).
+    Requests run in strict buckets of max_concurrent: a whole bucket must
+    finish before the next bucket starts. With vary_across_buckets, every
+    bucket after the first receives the previous bucket's prompts (enhanced
+    text where available, original after a failure) as a "do not repeat,
+    vary" reference appended to the system prompt.
 
     Args:
         base_url: Server base URL.
         model_name: Model id from /v1/models.
         system_prompt: Shared system prompt for all requests.
         prompts: List of (original_index, user_prompt) tuples.
-        max_concurrent: Max simultaneous requests. Defaults to len(prompts).
+        max_concurrent: Bucket size / max simultaneous requests. Defaults to len(prompts) (single bucket).
         request_timeout: Seconds to wait for a single request before retrying.
+        vary_across_buckets: Append each bucket the previous bucket's prompts as a variation reference.
 
     Returns:
-        List of (original_index, ChatResult) tuples, ordered by index.
+        List of (original_index, ChatResult) tuples, in input order.
     """
-    if max_concurrent is None:
-        max_concurrent = len(prompts)
+    bucket_size = max_concurrent if max_concurrent else max(len(prompts), 1)
+    buckets = _plan_buckets(prompts, bucket_size)
 
     async def _run() -> list[tuple[int, ChatResult]]:
-        semaphore = asyncio.Semaphore(max_concurrent)
-        connector = aiohttp.TCPConnector(limit=max_concurrent, force_close=False)
-
-        async def _semapped(idx: int, prompt: str) -> tuple[int, ChatResult]:
-            async with semaphore:
-                return await _chat_completion_async(
-                    session, base_url, model_name, system_prompt, prompt, idx,
-                    request_timeout=request_timeout,
-                )
+        connector = aiohttp.TCPConnector(limit=bucket_size, force_close=False)
+        all_results: list[tuple[int, ChatResult]] = []
+        previous_texts: list[str] = []
 
         async with aiohttp.ClientSession(connector=connector) as session:
-            tasks = [_semapped(idx, prompt) for idx, prompt in prompts]
-            return await asyncio.gather(*tasks)
+            for bucket_num, bucket in enumerate(buckets):
+                has_reference = vary_across_buckets and bool(previous_texts)
+                bucket_system = (
+                    system_prompt + _variation_reference_block(previous_texts)
+                    if has_reference
+                    else system_prompt
+                )
+                logger.info(
+                    "Bucket %d/%d: %d prompt(s)%s",
+                    bucket_num + 1, len(buckets), len(bucket),
+                    " (with previous-bucket reference)" if has_reference else "",
+                )
+                results = await asyncio.gather(
+                    *[
+                        _chat_completion_async(
+                            session, base_url, model_name, bucket_system, prompt, idx,
+                            request_timeout=request_timeout,
+                        )
+                        for idx, prompt in bucket
+                    ]
+                )
+                all_results.extend(results)
+                # What the next bucket should reference: the enhanced text
+                # actually used, or the original prompt where enhancement failed.
+                previous_texts = [
+                    chat_result.content or original
+                    for (_, original), (_, chat_result) in zip(bucket, results)
+                ]
+
+        return all_results
 
     return asyncio.run(_run())
 

@@ -837,14 +837,20 @@ class LlamaServerEnhance(scripts.Script):
         _warmup_chat_endpoint(base_url, model_name, num_slots=slot_count)
 
         # --- Step 1: Batch enhance positive prompts ---
+        # Prompts run in strict buckets of slot_count. Each bucket after the
+        # first receives the previous bucket's prompts as a "do not repeat,
+        # vary" reference so similar inputs don't collapse into clones.
+        num_buckets = (len(prompts_to_enhance) + slot_count - 1) // slot_count
         print(
             f"  Sending {len(prompts_to_enhance)} positive prompt(s) "
-            f"({slot_count} concurrent) ..."
+            f"({slot_count} concurrent, {num_buckets} bucket(s)) ..."
         )
+        _log_to_file(f"  → positive batch: {len(prompts_to_enhance)} prompt(s) in {num_buckets} bucket(s) of {slot_count}, cross-bucket variance enabled")
         pos_results = _batch_chat_completions(
             base_url, model_name, system_prompt, prompts_to_enhance,
             max_concurrent=slot_count,
             request_timeout=request_timeout,
+            vary_across_buckets=True,
         )
         pos_result_map: dict[int, ChatResult] = {idx: result for idx, result in pos_results}
 
