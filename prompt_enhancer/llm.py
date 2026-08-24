@@ -538,6 +538,7 @@ async def _chat_completion_async(
                 headers={"Authorization": "Bearer no-key"},
                 timeout=aiohttp.ClientTimeout(total=request_timeout),
             ) as resp:
+                resp.raise_for_status()
                 result = await resp.json(content_type=None)
                 content = result["choices"][0]["message"]["content"]
 
@@ -580,6 +581,8 @@ async def _chat_completion_async(
             with _print_lock:
                 print(f"  Retrying in {backoff:.0f}s...")
             await asyncio.sleep(backoff)
+    if not chat_result.content:
+        chat_result.error = last_error or "all retries failed"
 
     # Final status print
     with _print_lock:
