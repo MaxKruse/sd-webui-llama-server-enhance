@@ -56,7 +56,7 @@ The preset is automatically selected based on the Forge-Neo UI preset:
 | `anima` | `anima` |
 
 Included presets:
-- `presets/anima.txt` - for the [Anima](https://github.com/CircleStone-Labs/Anima) anime model
+- `presets/anima.txt` - for the [Anima](https://github.com/CircleStone-Labs/Anima) anime model. Enforces *scene completeness*: every enhanced output must include mood, lighting, environment, movement/pose, and character-environment interaction - the LLM invents fitting details for anything the user's prompt leaves unspecified
 - `presets/flux-dev.txt` - for FLUX.1 [dev]
 - `presets/flux-krea-dev.txt` - for FLUX.1 Krea [dev]
 - `presets/z-image-turbo.txt` - for Z-Image Turbo
