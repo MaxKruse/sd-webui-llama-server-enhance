@@ -46,6 +46,9 @@ from prompt_enhancer.llm import (
     _kill_server,
     _wait_for_server,
     _batch_chat_completions,
+    _discover_model_name,
+    _discover_slot_count,
+    _warmup_chat_endpoint,
     enhance_prompt,
     spawn_server,
 )
@@ -200,8 +203,14 @@ def test_batch(
     user_prompts: list[str],
     extra_flags: str,
     request_timeout: float = 120,
+    concurrency: int = 0,
 ):
-    """Batch mode: start ONE server, send ALL prompts in parallel, collect all, kill."""
+    """Batch mode: start ONE server, send prompts in buckets, collect all, kill.
+
+    Mirrors the production pipeline: prompts run in strict buckets of
+    max(server slots, --concurrency), and each bucket after the first
+    receives the previous bucket's prompts as a "do not repeat, vary" reference.
+    """
     _print_header(f"Live Inference Test (Batch — {len(user_prompts)} prompt(s))")
 
     # Start a single server
@@ -212,14 +221,28 @@ def test_batch(
     # Build indexed prompt list
     prompts_to_enhance = list(enumerate(user_prompts))
 
-    # Discover the loaded model name
-    from prompt_enhancer.llm import _discover_model_name
+    # Discover the loaded model name and parallel slot count
     model_name = _discover_model_name(base_url)
+    slot_count = _discover_slot_count(base_url, model_name)
+    bucket_size = concurrency or slot_count
+    num_buckets = (len(prompts_to_enhance) + bucket_size - 1) // bucket_size
 
-    # Send all prompts concurrently
-    print(f"  Sending {len(prompts_to_enhance)} prompt(s) in parallel...")
+    # Warm up the chat endpoint - /health returns 200 before parallel slots
+    # are initialized, causing HTTP 400 on the first real request.
+    _warmup_chat_endpoint(base_url, model_name, num_slots=slot_count)
+
+    # Send prompts in buckets with cross-bucket variation
+    print(
+        f"  Sending {len(prompts_to_enhance)} prompt(s) in {num_buckets} bucket(s) of {bucket_size} "
+        f"(server slots: {slot_count}, cross-bucket variation enabled) ..."
+    )
     start = time.monotonic()
-    results = _batch_chat_completions(base_url, model_name, system_prompt, prompts_to_enhance, request_timeout=request_timeout)
+    results = _batch_chat_completions(
+        base_url, model_name, system_prompt, prompts_to_enhance,
+        max_concurrent=bucket_size,
+        request_timeout=request_timeout,
+        vary_across_buckets=True,
+    )
     elapsed = time.monotonic() - start
 
     # Kill the server
@@ -284,6 +307,12 @@ def main():
         type=float,
         default=120,
         help="Seconds to wait for a single LLM request before retrying (default: 120)",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=0,
+        help="Bucket size for batch mode (default: 0 = use server's parallel slot count)",
     )
 
     args = parser.parse_args()
@@ -361,6 +390,7 @@ def main():
             user_prompts=user_prompts,
             extra_flags=args.flags,
             request_timeout=args.timeout,
+            concurrency=args.concurrency,
         )
     else:
         test_single(
