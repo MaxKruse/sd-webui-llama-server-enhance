@@ -10,9 +10,6 @@ from pathlib import Path
 
 PRESETS_DIR = Path(__file__).resolve().parent.parent / "presets"
 
-# Sentinel value shown in the UI dropdown for auto-selection.
-AUTO_PRESET = "Auto"
-
 # Mapping from Forge-Neo UI preset names (PresetArch) to our LLM preset filenames.
 # Keys are lowercase forge preset names; values are preset names (without .txt).
 FORGE_TO_PRESET_MAP: dict[str, str] = {
@@ -43,26 +40,21 @@ def load_preset(name: str) -> str | None:
     return preset_path.read_text(encoding="utf-8").strip()
 
 
-def resolve_preset(
-    selected: str | None,
+def resolve_auto_preset(
     *,
     forge_preset: str | None = None,
     checkpoint_name: str | None = None,
 ) -> str | None:
-    """Resolve the effective preset name, handling 'Auto' selection.
+    """Resolve the preset from the current Forge-Neo UI preset (always auto).
 
     Args:
-        selected: The value from the UI dropdown (may be AUTO_PRESET).
         forge_preset: Current Forge-Neo UI preset (shared.opts.forge_preset).
         checkpoint_name: Current checkpoint name (shared.opts.sd_model_checkpoint).
 
     Returns:
-        The resolved preset name (e.g. "flux-dev"), or None if unresolved.
+        The resolved preset name (e.g. "flux-dev"), or None if the Forge
+        preset has no mapping.
     """
-    if not selected or selected != AUTO_PRESET:
-        return selected
-
-    # Auto mode: derive from Forge-Neo preset
     if not forge_preset:
         return None
 

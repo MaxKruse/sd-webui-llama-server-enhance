@@ -23,6 +23,7 @@ from modules.processing import StableDiffusionProcessing
 from prompt_enhancer import settings as _settings_module
 from prompt_enhancer.llm import (
     ChatResult,
+    DEFAULT_REQUEST_TIMEOUT,
     _SERVER_STARTUP_TIMEOUT,
     _ServerProcess,
     _discover_model_name,
@@ -32,9 +33,8 @@ from prompt_enhancer.llm import (
     _kill_server,
     chat_completion_request,
     spawn_healthy_server,
-    enhance_prompt,
 )
-from prompt_enhancer.presets import AUTO_PRESET, load_preset, resolve_preset
+from prompt_enhancer.presets import load_preset, resolve_auto_preset
 
 logger = logging.getLogger(__name__)
 
@@ -80,10 +80,16 @@ def _log_to_file(msg: str):
 def _read_request_timeout() -> float:
     """Read the per-request LLM timeout from settings (seconds)."""
     try:
-        return float(getattr(shared.opts, "llama_enhance_timeout", 120) or 120)
+        return float(
+            getattr(shared.opts, "llama_enhance_timeout", DEFAULT_REQUEST_TIMEOUT)
+            or DEFAULT_REQUEST_TIMEOUT
+        )
     except (TypeError, ValueError):
-        logger.warning("Invalid llama_enhance_timeout value - falling back to 120s")
-        return 120.0
+        logger.warning(
+            "Invalid llama_enhance_timeout value - falling back to %ss",
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        return float(DEFAULT_REQUEST_TIMEOUT)
 
 
 def _read_startup_timeout() -> float:
@@ -423,26 +429,6 @@ def _build_base_system_prompt(
     return result
 
 
-def _effective_system_prompt(
-    preset_content: str,
-    *,
-    width: int = 0,
-    height: int = 0,
-    hires: bool = False,
-    base_width: int = 0,
-    base_height: int = 0,
-) -> str:
-    """System prompt for the positive-prompt enhancement call."""
-    return _build_base_system_prompt(
-        preset_content,
-        width=width,
-        height=height,
-        hires=hires,
-        base_width=base_width,
-        base_height=base_height,
-    )
-
-
 def _effective_negative_system_prompt(
     preset_content: str,
     *,
@@ -630,8 +616,7 @@ class LlamaServerEnhance(scripts.Script):
         # Resolve preset — always auto-selected based on Forge-Neo UI preset
         forge_preset = getattr(shared.opts, "forge_preset", None)
         checkpoint_name = getattr(shared.opts, "sd_model_checkpoint", None)
-        resolved = resolve_preset(
-            AUTO_PRESET,
+        resolved = resolve_auto_preset(
             forge_preset=forge_preset,
             checkpoint_name=checkpoint_name,
         )
@@ -658,7 +643,7 @@ class LlamaServerEnhance(scripts.Script):
         )
 
         # Build system prompts (preset + resolution + Dynamic Prompts wildcard note)
-        system_prompt = _effective_system_prompt(
+        system_prompt = _build_base_system_prompt(
             preset_content,
             width=final_w,
             height=final_h,

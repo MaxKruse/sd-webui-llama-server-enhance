@@ -199,9 +199,6 @@ class _ServerProcess:
         self._stdout_drainer.join(timeout=2)
         self._stderr_drainer.join(timeout=2)
 
-    def stdout_tail(self, max_chars: int = 3000) -> str:
-        return self._stdout_drainer.tail(max_chars)
-
     def stderr_tail(self, max_chars: int = 3000) -> str:
         return self._stderr_drainer.tail(max_chars)
 
@@ -334,11 +331,6 @@ class ChatResult:
         self.prompt_ms = prompt_ms
         self.predicted_ms = predicted_ms
         self.error = error
-
-    @property
-    def prompt_tps(self) -> float:
-        """Tokens per second for prompt processing."""
-        return self.prompt_tokens / (self.prompt_ms / 1000) if self.prompt_ms > 0 else 0.0
 
     @property
     def generation_tps(self) -> float:
