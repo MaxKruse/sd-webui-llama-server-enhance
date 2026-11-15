@@ -107,12 +107,21 @@ def _build_command(
 
 def _wait_for_server(
     base_url: str,
-    timeout: int = _SERVER_STARTUP_TIMEOUT,
+    timeout: float = _SERVER_STARTUP_TIMEOUT,
     proc: subprocess.Popen | None = None,
+    heartbeat_interval: float = 10.0,
 ) -> bool:
     """Poll /health until the server responds, the timeout is reached, or the
-    process exits early (a crashed server can never become healthy)."""
+    process exits early (a crashed server can never become healthy).
+
+    Prints a heartbeat line every heartbeat_interval seconds so a slow model
+    load (up to `timeout` seconds of console silence) looks alive instead of
+    hung. Full load progress stays in the debug log - streaming all of the
+    server's stderr to the console would be noise.
+    """
     deadline = time.monotonic() + timeout
+    start = time.monotonic()
+    next_heartbeat = start + heartbeat_interval
     url = f"{base_url}/health"
 
     while time.monotonic() < deadline:
@@ -125,6 +134,9 @@ def _wait_for_server(
                     return True
         except (error.URLError, ConnectionError, OSError):
             pass
+        if time.monotonic() >= next_heartbeat:
+            print(f"  ... still loading ({time.monotonic() - start:.0f}s / {timeout:.0f}s)")
+            next_heartbeat += heartbeat_interval
         time.sleep(0.5)
 
     return False
