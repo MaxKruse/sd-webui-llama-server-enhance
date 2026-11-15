@@ -4,8 +4,10 @@ Spawns a temporary llama-server instance, sends prompts via the OpenAI-compatibl
 /v1/chat/completions endpoint, extracts the `content` field (reasoning_content is
 stripped server-side), then kills the server.
 
-Supports both single-prompt and batch-prompt modes. In batch mode all requests are
-fired concurrently so the server can process them in parallel.
+Supports both single-prompt and batch-prompt modes. In batch mode requests run
+in strict buckets of ``max_concurrent``: a whole bucket must finish before the
+next one starts, so the server's parallel slots stay busy without unbounded
+overlap.
 """
 
 from __future__ import annotations
@@ -50,7 +52,7 @@ def _find_free_port() -> int:
     There's a tiny race window between releasing the socket and
     llama-server binding, but it's negligible in practice.
     """
-    candidates = random.sample(list(_PORT_RANGE), min(100, len(_PORT_RANGE)))
+    candidates = random.sample(_PORT_RANGE, 100)
     for port in candidates:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -197,9 +199,6 @@ class _ServerProcess:
         self._stdout_drainer.join(timeout=2)
         self._stderr_drainer.join(timeout=2)
 
-    def stdout_tail(self, max_chars: int = 3000) -> str:
-        return self._stdout_drainer.tail(max_chars)
-
     def stderr_tail(self, max_chars: int = 3000) -> str:
         return self._stderr_drainer.tail(max_chars)
 
@@ -237,6 +236,78 @@ def spawn_server(
     return sp
 
 
+def spawn_healthy_server(
+    server_path: str,
+    model_path: str,
+    extra_flags: str,
+    *,
+    startup_timeout: float | None = None,
+    on_stderr=None,
+    on_debug=None,
+    label: str = "",
+) -> _ServerProcess | None:
+    """Start a llama-server and wait until it is healthy.
+
+    Single spawn-wait-kill path shared by the WebUI integration,
+    ``enhance_prompt`` and the test scripts.
+
+    Progress is printed to stdout. ``on_stderr`` (optional callable)
+    receives decoded stderr chunks as they arrive; ``on_debug`` (optional
+    callable) receives the same diagnostic lines for a debug log sink, and
+    when absent the failure stderr tail goes to ``logger`` instead.
+    ``label`` is appended to the "Running llama-server" line (e.g. " (test)").
+
+    Returns the server handle, or None on failure (the server is already
+    killed in that case).
+    """
+    timeout = float(_SERVER_STARTUP_TIMEOUT if startup_timeout is None else startup_timeout)
+    port = _find_free_port()
+    model_name = Path(model_path).name
+
+    def _emit(line: str):
+        if on_debug is not None:
+            on_debug(line)
+
+    print(f"\n  Running llama-server (model: {model_name}, port: {port}){label}...")
+    _emit(f"  Running llama-server (model: {model_name}, port: {port}){label}...")
+
+    try:
+        sp = spawn_server(server_path, model_path, port, extra_flags, on_stderr=on_stderr)
+    except FileNotFoundError:
+        logger.error("llama-server not found at: %s", server_path)
+        print(f"  FAILED: llama-server not found at: {server_path}")
+        _emit(f"  → llama-server not found at {server_path}")
+        return None
+    except Exception:
+        logger.exception("Failed to start llama-server")
+        print("  FAILED: could not start llama-server")
+        _emit("  → failed to start llama-server")
+        return None
+
+    print(f"  Waiting for server to start (timeout: {timeout:.0f}s)...")
+    _emit(f"  Waiting for server to start (timeout: {timeout:.0f}s)...")
+    start = time.monotonic()
+
+    if not _wait_for_server(sp.base_url, timeout=timeout, proc=sp.proc):
+        elapsed = time.monotonic() - start
+        print(f"  FAILED: Server did not become healthy within {timeout:.0f}s ({elapsed:.1f}s elapsed)")
+        logger.error("Server did not become healthy within %.0fs", timeout)
+        _emit(f"  → server health check failed after {elapsed:.1f}s")
+        stderr_tail = sp.stderr_tail(3000)
+        if stderr_tail.strip():
+            _emit(f"  llama-server stderr (last 3000 chars):\n{stderr_tail}")
+            print(f"  Server stderr (last 500 chars):\n{stderr_tail[-500:]}")
+            if on_debug is None:
+                logger.warning("llama-server stderr (last 2000 chars):\n%s", stderr_tail[-2000:])
+        _kill_server(sp)
+        return None
+
+    elapsed = time.monotonic() - start
+    print(f"  Server ready on port {port} in {elapsed:.1f}s")
+    _emit(f"  Server ready on port {port} in {elapsed:.1f}s")
+    return sp
+
+
 _print_lock = Lock()
 
 
@@ -260,11 +331,6 @@ class ChatResult:
         self.prompt_ms = prompt_ms
         self.predicted_ms = predicted_ms
         self.error = error
-
-    @property
-    def prompt_tps(self) -> float:
-        """Tokens per second for prompt processing."""
-        return self.prompt_tokens / (self.prompt_ms / 1000) if self.prompt_ms > 0 else 0.0
 
     @property
     def generation_tps(self) -> float:
@@ -409,6 +475,31 @@ def _is_transient_error(exc: BaseException) -> bool:
     return isinstance(exc, (error.URLError, aiohttp.ClientError, json.JSONDecodeError, ConnectionError, TimeoutError, OSError))
 
 
+def _retry_backoff(attempt: int) -> float:
+    """Backoff (seconds) after a failed 1-based attempt: 3, 6, 12, 24 (capped 30).
+
+    A single request can take 16-30 s, so wide spacing is needed so later
+    attempts land after the first batch frees its slots.
+    """
+    return min(3 * (2 ** (attempt - 1)), 30)
+
+
+def _describe_error(exc: BaseException) -> str:
+    """One-line description of a chat-completion failure.
+
+    Shared by the sync (urllib) and async (aiohttp) retry loops. For
+    HTTP errors the response body is included (truncated) because it
+    usually carries the real reason (context overflow, bad request, ...).
+    """
+    if isinstance(exc, error.HTTPError):
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = "<unreadable>"
+        return f"HTTP {exc.code}: {body[:500]}"
+    return f"{type(exc).__name__}: {exc}"
+
+
 def _chat_completion(
     base_url: str,
     model_name: str,
@@ -472,14 +563,7 @@ def _chat_completion(
                     predicted_ms=predicted_ms,
                 )
         except Exception as exc:
-            if isinstance(exc, error.HTTPError):
-                try:
-                    body = exc.read().decode("utf-8", errors="replace")
-                except Exception:
-                    body = "<unreadable>"
-                last_error = f"HTTP {exc.code}: {body[:500]}"
-            else:
-                last_error = f"{type(exc).__name__}: {exc}"
+            last_error = _describe_error(exc)
             logger.error("Chat completion request failed (attempt %d/%d): %s", attempt, _MAX_CHAT_RETRIES, last_error)
             print(f"  Chat completion request failed (attempt {attempt}/{_MAX_CHAT_RETRIES}): {last_error}")
 
@@ -488,10 +572,8 @@ def _chat_completion(
                 break
 
         # Retry with exponential backoff (skip sleep on last attempt).
-        # Requests can take 16-30 s, so we need wide spacing so later
-        # attempts land after the first batch frees its slots.
         if attempt < _MAX_CHAT_RETRIES:
-            backoff = min(3 * (2 ** (attempt - 1)), 30)  # 3s, 6s, 12s, 24s (capped 30s)
+            backoff = _retry_backoff(attempt)
             logger.info("Retrying in %.1fs...", backoff)
             print(f"  Retrying in {backoff:.0f}s...")
             time.sleep(backoff)
@@ -531,6 +613,8 @@ async def _chat_completion_async(
     chat_result = ChatResult()
 
     for attempt in range(1, _MAX_CHAT_RETRIES + 1):
+        http_error_body = ""
+        failed_exc: BaseException | None = None
         try:
             async with session.post(
                 f"{base_url}/v1/chat/completions",
@@ -538,7 +622,16 @@ async def _chat_completion_async(
                 headers={"Authorization": "Bearer no-key"},
                 timeout=aiohttp.ClientTimeout(total=request_timeout),
             ) as resp:
-                resp.raise_for_status()
+                try:
+                    resp.raise_for_status()
+                except aiohttp.ClientResponseError:
+                    # Response is still open: read the body for diagnostics.
+                    # (ClientResponseError does not expose it.)
+                    try:
+                        http_error_body = (await resp.read()).decode("utf-8", errors="replace")[:500]
+                    except Exception:
+                        http_error_body = "<unreadable>"
+                    raise
                 result = await resp.json(content_type=None)
                 content = result["choices"][0]["message"]["content"]
 
@@ -558,25 +651,27 @@ async def _chat_completion_async(
                     predicted_ms=predicted_ms,
                 )
                 break  # Success
-
+        except aiohttp.ClientResponseError as exc:
+            failed_exc = exc
+            last_error = f"HTTP {exc.status}: {http_error_body}"
         except Exception as exc:
-            if isinstance(exc, aiohttp.ClientResponseError):
-                last_error = f"HTTP {exc.status}: {exc.message}"
-            else:
-                last_error = f"{type(exc).__name__}: {exc}"
-            logger.error("Chat completion request failed (attempt %d/%d): %s", attempt, _MAX_CHAT_RETRIES, last_error)
-            with _print_lock:
-                print(f"  Chat completion request failed (attempt {attempt}/{_MAX_CHAT_RETRIES}): {last_error}")
+            failed_exc = exc
+            last_error = _describe_error(exc)
+        else:
+            continue  # unreachable: the success path breaks above
 
-            if not _is_transient_error(exc):
-                logger.error("Error is not transient - not retrying")
-                break
+        # A request failed on this attempt - log, decide on retry.
+        logger.error("Chat completion request failed (attempt %d/%d): %s", attempt, _MAX_CHAT_RETRIES, last_error)
+        with _print_lock:
+            print(f"  Chat completion request failed (attempt {attempt}/{_MAX_CHAT_RETRIES}): {last_error}")
+
+        if not _is_transient_error(failed_exc):
+            logger.error("Error is not transient - not retrying")
+            break
 
         # Retry with exponential backoff (skip sleep on last attempt).
-        # Requests can take 16-30 s, so we need wide spacing so later
-        # attempts land after the first batch frees its slots.
         if attempt < _MAX_CHAT_RETRIES:
-            backoff = min(3 * (2 ** (attempt - 1)), 30)  # 3s, 6s, 12s, 24s (capped 30s)
+            backoff = _retry_backoff(attempt)
             logger.info("Retrying in %.1fs...", backoff)
             with _print_lock:
                 print(f"  Retrying in {backoff:.0f}s...")
@@ -749,58 +844,33 @@ def enhance_prompt(
     extra_flags: str = "",
     *,
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+    startup_timeout: float | None = None,
 ) -> ChatResult:
     """Enhance a prompt by spawning a temporary llama-server instance.
 
-    1. Find a free port by probing the ephemeral range.
-    2. Start llama-server on that port (output pipes drained continuously).
-    3. Wait for /health to confirm the server is ready.
-    4. Send the prompt via /v1/chat/completions.
-    5. Kill the server.
-    6. Return a ChatResult with content and timing stats.
+    1. Start llama-server on a free port (output pipes drained continuously).
+    2. Wait for /health to confirm the server is ready.
+    3. Send the prompt via /v1/chat/completions.
+    4. Kill the server (always, even on failure).
+    5. Return a ChatResult with content and timing stats.
     """
     if not Path(model_path).is_file():
         logger.error("Model file not found: %s", model_path)
         return ChatResult()
 
-    port = _find_free_port()
     logger.info("llama-server user prompt: %s", user_prompt)
-    print(f"\n  Running llama-server (model: {Path(model_path).name}, port: {port})...")
+    sp = spawn_healthy_server(
+        server_path, model_path, extra_flags, startup_timeout=startup_timeout,
+    )
+    if sp is None:
+        return ChatResult()
 
     try:
-        sp = spawn_server(server_path, model_path, port, extra_flags)
-    except FileNotFoundError:
-        logger.error("llama-server not found at: %s", server_path)
-        print(f"  FAILED: llama-server not found at: {server_path}")
-        return ChatResult()
-    except Exception:
-        logger.exception("Failed to start llama-server")
-        return ChatResult()
-
-    # Wait for /health to confirm the server is fully ready
-    print(f"  Waiting for server to start (timeout: {_SERVER_STARTUP_TIMEOUT}s)...")
-    start = time.monotonic()
-
-    if not _wait_for_server(sp.base_url, timeout=_SERVER_STARTUP_TIMEOUT, proc=sp.proc):
-        elapsed = time.monotonic() - start
-        print(f"  FAILED: Server did not become healthy within {_SERVER_STARTUP_TIMEOUT}s ({elapsed:.1f}s elapsed)")
-        logger.error("Server did not become healthy within %ds", _SERVER_STARTUP_TIMEOUT)
-        stderr_tail = sp.stderr_tail(2000)
-        if stderr_tail.strip():
-            logger.error("Server stderr (last 2000 chars):\n%s", stderr_tail)
+        return chat_completion_request(
+            sp, system_prompt, user_prompt, request_timeout=request_timeout,
+        )
+    finally:
         _kill_server(sp)
-        return ChatResult()
-
-    ready_time = time.monotonic()
-    print(f"  Server ready on port {port} in {ready_time - start:.1f}s.")
-
-    result = chat_completion_request(
-        sp, system_prompt, user_prompt, request_timeout=request_timeout,
-    )
-
-    # Always kill the server
-    _kill_server(sp)
-    return result
 
 
 def _kill_server(sp: _ServerProcess | None):

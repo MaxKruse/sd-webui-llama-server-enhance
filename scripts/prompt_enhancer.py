@@ -23,20 +23,18 @@ from modules.processing import StableDiffusionProcessing
 from prompt_enhancer import settings as _settings_module
 from prompt_enhancer.llm import (
     ChatResult,
+    DEFAULT_REQUEST_TIMEOUT,
     _SERVER_STARTUP_TIMEOUT,
     _ServerProcess,
     _discover_model_name,
     _discover_slot_count,
-    _find_free_port,
-    _wait_for_server,
     _warmup_chat_endpoint,
     _batch_chat_completions,
     _kill_server,
     chat_completion_request,
-    spawn_server,
-    enhance_prompt,
+    spawn_healthy_server,
 )
-from prompt_enhancer.presets import AUTO_PRESET, load_preset, resolve_preset
+from prompt_enhancer.presets import load_preset, resolve_auto_preset
 
 logger = logging.getLogger(__name__)
 
@@ -82,10 +80,16 @@ def _log_to_file(msg: str):
 def _read_request_timeout() -> float:
     """Read the per-request LLM timeout from settings (seconds)."""
     try:
-        return float(getattr(shared.opts, "llama_enhance_timeout", 120) or 120)
+        return float(
+            getattr(shared.opts, "llama_enhance_timeout", DEFAULT_REQUEST_TIMEOUT)
+            or DEFAULT_REQUEST_TIMEOUT
+        )
     except (TypeError, ValueError):
-        logger.warning("Invalid llama_enhance_timeout value - falling back to 120s")
-        return 120.0
+        logger.warning(
+            "Invalid llama_enhance_timeout value - falling back to %ss",
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        return float(DEFAULT_REQUEST_TIMEOUT)
 
 
 def _read_startup_timeout() -> float:
@@ -103,6 +107,21 @@ def _read_startup_timeout() -> float:
         return float(_SERVER_STARTUP_TIMEOUT)
 
 
+# Bucket-size dropdown choices for "Per image" mode. The Auto choice means
+# "use the server's parallel slot count" (discovered from /slots at run time).
+BUCKET_SIZE_AUTO = "Auto (server slots)"
+BUCKET_SIZE_CHOICES = [BUCKET_SIZE_AUTO, "1", "2", "3", "4", "5", "6", "8", "10", "16"]
+
+
+def _parse_bucket_size(raw) -> int:
+    """Parse the bucket-size dropdown value; returns 0 for auto/invalid."""
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 0
+    return max(1, value)
+
+
 def _spawn_healthy_server(
     server_path: str,
     model_path: str,
@@ -111,49 +130,26 @@ def _spawn_healthy_server(
 ) -> _ServerProcess | None:
     """Start llama-server and wait until it becomes healthy.
 
-    Streams the server's stderr into the debug log while it runs.
-    Returns the server handle, or None on failure (already logged and killed).
+    Thin wrapper over the host-independent ``spawn_healthy_server`` that wires
+    in the WebUI-specific bits: the user-configured startup timeout and the
+    debug-log sinks (server stderr streamed in as ``[llama-server]`` lines,
+    plus the same diagnostic lines the helper prints).
     """
-    port = _find_free_port()
-    print(f"\n  Running llama-server (model: {Path(model_path).name}, port: {port}){label}...")
 
     def _on_stderr(chunk: str):
         for line in chunk.rstrip("\n").split("\n"):
             if line.strip():
                 _log_to_file(f"  [llama-server] {line}")
 
-    try:
-        sp = spawn_server(server_path, model_path, port, extra_flags, on_stderr=_on_stderr)
-    except FileNotFoundError:
-        logger.error("llama-server not found at: %s", server_path)
-        print(f"  FAILED: llama-server not found at: {server_path}")
-        _log_to_file(f"  → llama-server not found at {server_path}")
-        return None
-    except Exception:
-        logger.exception("Failed to start llama-server")
-        _log_to_file("  → failed to start llama-server")
-        return None
-
-    startup_timeout = _read_startup_timeout()
-    print(f"  Waiting for server to start (timeout: {startup_timeout:.0f}s)...")
-    start = time.monotonic()
-
-    if not _wait_for_server(sp.base_url, timeout=startup_timeout, proc=sp.proc):
-        elapsed = time.monotonic() - start
-        print(f"  FAILED: Server did not become healthy within {startup_timeout:.0f}s ({elapsed:.1f}s elapsed)")
-        logger.error("Server did not become healthy within %.0fs", startup_timeout)
-        _log_to_file(f"  → server health check failed after {elapsed:.1f}s")
-        stderr_tail = sp.stderr_tail(3000)
-        if stderr_tail.strip():
-            _log_to_file(f"  llama-server stderr (last 3000 chars):\n{stderr_tail}")
-            print(f"  Server stderr (last 500 chars):\n{stderr_tail[-500:]}")
-        _kill_server(sp)
-        return None
-
-    elapsed = time.monotonic() - start
-    print(f"  Server ready on port {port} in {elapsed:.1f}s")
-    _log_to_file(f"  Server ready on port {port} in {elapsed:.1f}s")
-    return sp
+    return spawn_healthy_server(
+        server_path,
+        model_path,
+        extra_flags,
+        startup_timeout=_read_startup_timeout(),
+        on_stderr=_on_stderr,
+        on_debug=_log_to_file,
+        label=label,
+    )
 
 
 def _free_gpu_memory():
@@ -448,26 +444,6 @@ def _build_base_system_prompt(
     return result
 
 
-def _effective_system_prompt(
-    preset_content: str,
-    *,
-    width: int = 0,
-    height: int = 0,
-    hires: bool = False,
-    base_width: int = 0,
-    base_height: int = 0,
-) -> str:
-    """System prompt for the positive-prompt enhancement call."""
-    return _build_base_system_prompt(
-        preset_content,
-        width=width,
-        height=height,
-        hires=hires,
-        base_width=base_width,
-        base_height=base_height,
-    )
-
-
 def _effective_negative_system_prompt(
     preset_content: str,
     *,
@@ -493,8 +469,12 @@ def _effective_negative_system_prompt(
 class LlamaServerEnhance(scripts.Script):
     """Enhance positive prompts through a local LLM (llama-server)."""
 
-    # Run BEFORE sd-dynamic-prompts (priority 1000) so we enhance the raw
-    # prompt (with wildcards/variants intact), then DP expands them.
+    # NOTE: sorting_priority only orders this always-visible UI accordion
+    # section - it does NOT control process() call order. Forge invokes
+    # process() in extension discovery order (alphabetical), so
+    # sd-dynamic-prompts normally expands wildcards BEFORE we enhance.
+    # To enhance raw prompts first, pin this script above "Script" in
+    # Settings -> "Script process callback priority".
     sorting_priority = 999
 
     def title(self):
@@ -522,6 +502,14 @@ class LlamaServerEnhance(scripts.Script):
                 interactive=True,
                 elem_id=self.elem_id("enhance-mode"),
             )
+            bucket_size = gr.Dropdown(
+                choices=BUCKET_SIZE_CHOICES,
+                value=BUCKET_SIZE_AUTO,
+                label="Bucket size (Per image mode)",
+                info="Prompts per bucket = max concurrent LLM requests. Auto = the server's parallel slot count.",
+                interactive=True,
+                elem_id=self.elem_id("bucket-size"),
+            )
             enhance_negative = gr.Checkbox(
                 value=False,
                 label="Also enhance negative prompt",
@@ -529,6 +517,11 @@ class LlamaServerEnhance(scripts.Script):
                 interactive=True,
                 elem_id=self.elem_id("enhance-negative"),
             )
+
+            def _on_mode_change(mode: str):
+                return gr.update(visible=mode != "Once")
+
+            enhance_mode.change(fn=_on_mode_change, inputs=[enhance_mode], outputs=[bucket_size])
 
             test_button = gr.Button("Test server", variant="secondary")
             test_output = gr.Textbox(
@@ -539,7 +532,7 @@ class LlamaServerEnhance(scripts.Script):
             )
             test_button.click(fn=self._test_server, outputs=[test_output])
 
-        return [enable, enhance_mode, enhance_negative]
+        return [enable, enhance_mode, bucket_size, enhance_negative]
 
     def _test_server(self) -> str:
         """UI button handler: validate the configured server without generating."""
@@ -636,11 +629,12 @@ class LlamaServerEnhance(scripts.Script):
         p: StableDiffusionProcessing,
         enable: bool,
         enhance_mode: str,
+        bucket_size: str,
         enhance_negative: bool,
     ):
         """Called once before any sampling. Enhance prompts here."""
         _log_to_file("=" * 72)
-        _log_to_file(f"process() entered — enable={enable!r}, mode={enhance_mode!r}, enhance_negative={enhance_negative!r}")
+        _log_to_file(f"process() entered — enable={enable!r}, mode={enhance_mode!r}, bucket_size={bucket_size!r}, enhance_negative={enhance_negative!r}")
         _log_to_file(f"  p.all_prompts (input)  = {p.all_prompts!r}")
         _log_to_file(f"  p.all_negative_prompts (input) = {p.all_negative_prompts!r}")
         _log_to_file(f"  p.n_iter = {p.n_iter}, p.batch_size = {p.batch_size}")
@@ -655,8 +649,7 @@ class LlamaServerEnhance(scripts.Script):
         # Resolve preset — always auto-selected based on Forge-Neo UI preset
         forge_preset = getattr(shared.opts, "forge_preset", None)
         checkpoint_name = getattr(shared.opts, "sd_model_checkpoint", None)
-        resolved = resolve_preset(
-            AUTO_PRESET,
+        resolved = resolve_auto_preset(
             forge_preset=forge_preset,
             checkpoint_name=checkpoint_name,
         )
@@ -683,7 +676,7 @@ class LlamaServerEnhance(scripts.Script):
         )
 
         # Build system prompts (preset + resolution + Dynamic Prompts wildcard note)
-        system_prompt = _effective_system_prompt(
+        system_prompt = _build_base_system_prompt(
             preset_content,
             width=final_w,
             height=final_h,
@@ -789,6 +782,11 @@ class LlamaServerEnhance(scripts.Script):
                 _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
             finally:
                 _kill_server(sp)
+            # Every Once-mode path exits here (failure paths return inside the
+            # try). Without this return the success path would fall through
+            # into Per-image mode and re-enhance the already-enhanced prompts
+            # with a second server.
+            return
 
         # "Per image" mode: start ONE server, batch positives, then batch negatives
         _log_to_file(f"  → Per image mode: {len(p.all_prompts)} prompt(s)")
@@ -821,122 +819,134 @@ class LlamaServerEnhance(scripts.Script):
 
         base_url = sp.base_url
 
-        # Discover the loaded model name
-        model_name = _discover_model_name(base_url)
-        _log_to_file(f"  Discovered model: {model_name}")
+        try:
+            # Discover the loaded model name
+            model_name = _discover_model_name(base_url)
+            _log_to_file(f"  Discovered model: {model_name}")
 
-        # Discover how many parallel slots the server has
-        slot_count = _discover_slot_count(base_url, model_name)
-        _log_to_file(f"  Discovered {slot_count} slot(s)")
+            # Discover how many parallel slots the server has
+            slot_count = _discover_slot_count(base_url, model_name)
+            _log_to_file(f"  Discovered {slot_count} slot(s)")
 
-        print(f"  Model: {model_name}, Slots: {slot_count}")
-
-        # Warm up the chat endpoint — /health returns 200 before parallel slots
-        # are initialized, causing HTTP 400 on the first real request.
-        # Warm up exactly as many slots as the server has.
-        _warmup_chat_endpoint(base_url, model_name, num_slots=slot_count)
-
-        # --- Step 1: Batch enhance positive prompts ---
-        # Prompts run in strict buckets of slot_count. Each bucket after the
-        # first receives the previous bucket's prompts as a "do not repeat,
-        # vary" reference so similar inputs don't collapse into clones.
-        num_buckets = (len(prompts_to_enhance) + slot_count - 1) // slot_count
-        print(
-            f"  Sending {len(prompts_to_enhance)} positive prompt(s) "
-            f"({slot_count} concurrent, {num_buckets} bucket(s)) ..."
-        )
-        _log_to_file(f"  → positive batch: {len(prompts_to_enhance)} prompt(s) in {num_buckets} bucket(s) of {slot_count}, cross-bucket variance enabled")
-        pos_results = _batch_chat_completions(
-            base_url, model_name, system_prompt, prompts_to_enhance,
-            max_concurrent=slot_count,
-            request_timeout=request_timeout,
-            vary_across_buckets=True,
-        )
-        pos_result_map: dict[int, ChatResult] = {idx: result for idx, result in pos_results}
-
-        # Build enhanced positive list + track which indices succeeded
-        enhanced_prompts: list[str] = [""] * len(p.all_prompts)
-        successful_indices: list[int] = []
-
-        for idx, original in enumerate(p.all_prompts):
-            if idx in skipped_indices:
-                enhanced_prompts[idx] = original
-                continue
-
-            result = pos_result_map.get(idx)
-            if result and result.content:
-                _log_to_file(
-                    f"  → prompt {idx}: positive enhanced ({len(result.content)} chars, "
-                    f"{result.completion_tokens} tokens, {result.generation_tps:.1f} tok/s, "
-                    f"{result.total_ms:.0f}ms total)"
-                )
-
-                # Escape accidental DP syntax in the enhanced prompt
-                escaped_content = _escape_accidental_dp_syntax(original, result.content)
-
-                logger.info("Prompt %d enhanced: %s → %s", idx + 1, original[:60], escaped_content[:60])
-                print(f"  Enhanced prompt {idx + 1} (full): {escaped_content}")
-                enhanced_prompts[idx] = escaped_content
-                successful_indices.append(idx)
+            # Resolve the effective bucket size (max concurrent LLM requests
+            # per bucket). The dropdown's Auto choice maps to the slot count.
+            bucket = _parse_bucket_size(bucket_size)
+            if bucket == 0:
+                bucket = slot_count
+                _log_to_file(f"  bucket size: auto → {slot_count} (server slots)")
             else:
-                error_detail = result.error if result and result.error else "no result"
-                _log_to_file(f"  → prompt {idx}: positive enhancement failed ({error_detail}), keeping original")
-                logger.info("Prompt %d: using original (enhancement failed: %s)", idx + 1, error_detail)
-                print(f"  Prompt {idx + 1}: using original (enhancement failed: {error_detail})")
-                enhanced_prompts[idx] = original
+                suffix = f" (server has {slot_count} slots - requests will queue)" if bucket > slot_count else ""
+                _log_to_file(f"  bucket size: user choice {bucket}{suffix}")
 
-        # --- Step 2: Batch enhance negative prompts (if enabled) ---
-        # Start with original negatives as baseline (pad with empty strings if needed)
-        enhanced_negatives: list[str] = list(p.all_negative_prompts)
-        while len(enhanced_negatives) < len(enhanced_prompts):
-            enhanced_negatives.append("")
+            print(f"  Model: {model_name}, Slots: {slot_count}, Bucket: {bucket}")
 
-        if enhance_negative and successful_indices:
-            neg_prompts: list[tuple[int, str]] = []
-            for idx in successful_indices:
-                original_negative = p.all_negative_prompts[idx] if idx < len(p.all_negative_prompts) else ""
-                neg_user_prompt = _build_negative_user_prompt(enhanced_prompts[idx], original_negative)
-                neg_prompts.append((idx, neg_user_prompt))
+            # Warm up the chat endpoint — /health returns 200 before parallel slots
+            # are initialized, causing HTTP 400 on the first real request.
+            # Warm up exactly as many slots as the server has.
+            _warmup_chat_endpoint(base_url, model_name, num_slots=slot_count)
 
+            # --- Step 1: Batch enhance positive prompts ---
+            # Prompts run in strict buckets of slot_count. Each bucket after the
+            # first receives the previous bucket's prompts as a "do not repeat,
+            # vary" reference so similar inputs don't collapse into clones.
+            num_buckets = (len(prompts_to_enhance) + bucket - 1) // bucket
             print(
-                f"  Sending {len(neg_prompts)} negative prompt(s) "
-                f"({slot_count} concurrent) ..."
+                f"  Sending {len(prompts_to_enhance)} positive prompt(s) "
+                f"({bucket} concurrent, {num_buckets} bucket(s)) ..."
             )
-            neg_results = _batch_chat_completions(
-                base_url, model_name, negative_system_prompt, neg_prompts,
-                max_concurrent=slot_count,
+            _log_to_file(f"  → positive batch: {len(prompts_to_enhance)} prompt(s) in {num_buckets} bucket(s) of {bucket}, cross-bucket variance enabled")
+            pos_results = _batch_chat_completions(
+                base_url, model_name, system_prompt, prompts_to_enhance,
+                max_concurrent=bucket,
                 request_timeout=request_timeout,
+                vary_across_buckets=True,
             )
-            neg_result_map: dict[int, ChatResult] = {idx: result for idx, result in neg_results}
+            pos_result_map: dict[int, ChatResult] = {idx: result for idx, result in pos_results}
 
-            for idx in successful_indices:
-                original_negative = p.all_negative_prompts[idx] if idx < len(p.all_negative_prompts) else ""
-                result = neg_result_map.get(idx)
+            # Build enhanced positive list + track which indices succeeded
+            enhanced_prompts: list[str] = [""] * len(p.all_prompts)
+            successful_indices: list[int] = []
+
+            for idx, original in enumerate(p.all_prompts):
+                if idx in skipped_indices:
+                    enhanced_prompts[idx] = original
+                    continue
+
+                result = pos_result_map.get(idx)
                 if result and result.content:
                     _log_to_file(
-                        f"  → prompt {idx}: negative enhanced ({len(result.content)} chars, "
+                        f"  → prompt {idx}: positive enhanced ({len(result.content)} chars, "
                         f"{result.completion_tokens} tokens, {result.generation_tps:.1f} tok/s, "
                         f"{result.total_ms:.0f}ms total)"
                     )
 
-                    # Escape accidental DP syntax in the enhanced negative prompt
-                    escaped_negative = _escape_accidental_dp_syntax(original_negative, result.content)
+                    # Escape accidental DP syntax in the enhanced prompt
+                    escaped_content = _escape_accidental_dp_syntax(original, result.content)
 
-                    logger.info("Negative %d enhanced: %s → %s", idx + 1, original_negative[:60], escaped_negative[:60])
-                    print(f"  Enhanced negative {idx + 1} (full): {escaped_negative}")
-                    enhanced_negatives[idx] = escaped_negative
-                # else: keep original negative (already set as baseline)
+                    logger.info("Prompt %d enhanced: %s → %s", idx + 1, original[:60], escaped_content[:60])
+                    print(f"  Enhanced prompt {idx + 1} (full): {escaped_content}")
+                    enhanced_prompts[idx] = escaped_content
+                    successful_indices.append(idx)
+                else:
+                    error_detail = result.error if result and result.error else "no result"
+                    _log_to_file(f"  → prompt {idx}: positive enhancement failed ({error_detail}), keeping original")
+                    logger.info("Prompt %d: using original (enhancement failed: %s)", idx + 1, error_detail)
+                    print(f"  Prompt {idx + 1}: using original (enhancement failed: {error_detail})")
+                    enhanced_prompts[idx] = original
 
-        # Kill the server and capture stderr for diagnostics
-        _kill_server(sp)
-        stderr_tail = sp.stderr_tail(3000)
-        if stderr_tail.strip():
-            _log_to_file(f"  llama-server stderr (last 3000 chars):\n{stderr_tail}")
+            # --- Step 2: Batch enhance negative prompts (if enabled) ---
+            # Start with original negatives as baseline (pad with empty strings if needed)
+            enhanced_negatives: list[str] = list(p.all_negative_prompts)
+            while len(enhanced_negatives) < len(enhanced_prompts):
+                enhanced_negatives.append("")
 
-        p.all_prompts = enhanced_prompts
-        p.all_negative_prompts = enhanced_negatives
-        _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
-        _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
+            if enhance_negative and successful_indices:
+                neg_prompts: list[tuple[int, str]] = []
+                for idx in successful_indices:
+                    original_negative = p.all_negative_prompts[idx] if idx < len(p.all_negative_prompts) else ""
+                    neg_user_prompt = _build_negative_user_prompt(enhanced_prompts[idx], original_negative)
+                    neg_prompts.append((idx, neg_user_prompt))
+
+                print(
+                    f"  Sending {len(neg_prompts)} negative prompt(s) "
+                    f"({bucket} concurrent) ..."
+                )
+                neg_results = _batch_chat_completions(
+                    base_url, model_name, negative_system_prompt, neg_prompts,
+                    max_concurrent=bucket,
+                    request_timeout=request_timeout,
+                )
+                neg_result_map: dict[int, ChatResult] = {idx: result for idx, result in neg_results}
+
+                for idx in successful_indices:
+                    original_negative = p.all_negative_prompts[idx] if idx < len(p.all_negative_prompts) else ""
+                    result = neg_result_map.get(idx)
+                    if result and result.content:
+                        _log_to_file(
+                            f"  → prompt {idx}: negative enhanced ({len(result.content)} chars, "
+                            f"{result.completion_tokens} tokens, {result.generation_tps:.1f} tok/s, "
+                            f"{result.total_ms:.0f}ms total)"
+                        )
+
+                        # Escape accidental DP syntax in the enhanced negative prompt
+                        escaped_negative = _escape_accidental_dp_syntax(original_negative, result.content)
+
+                        logger.info("Negative %d enhanced: %s → %s", idx + 1, original_negative[:60], escaped_negative[:60])
+                        print(f"  Enhanced negative {idx + 1} (full): {escaped_negative}")
+                        enhanced_negatives[idx] = escaped_negative
+                    # else: keep original negative (already set as baseline)
+
+            p.all_prompts = enhanced_prompts
+            p.all_negative_prompts = enhanced_negatives
+            _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
+            _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
+        finally:
+            # Always kill the server: an unexpected exception above must not
+            # leak a GPU-resident llama-server (or its port) until restart.
+            _kill_server(sp)
+            stderr_tail = sp.stderr_tail(3000)
+            if stderr_tail.strip():
+                _log_to_file(f"  llama-server stderr (last 3000 chars):\n{stderr_tail}")
 
     def postprocess(self, p, processed, enable, *args):
         """Called after all processing ends. Unload SD models to free VRAM."""
