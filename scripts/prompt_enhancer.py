@@ -34,7 +34,7 @@ from prompt_enhancer.llm import (
     chat_completion_request,
     spawn_healthy_server,
 )
-from prompt_enhancer.presets import load_preset, resolve_auto_preset
+from prompt_enhancer.presets import load_preset, negatives_ignored, resolve_auto_preset
 
 logger = logging.getLogger(__name__)
 
@@ -513,7 +513,7 @@ class LlamaServerEnhance(scripts.Script):
             enhance_negative = gr.Checkbox(
                 value=False,
                 label="Also enhance negative prompt",
-                info="Ask the LLM to enhance the negative prompt too (uses the preset's negative prompt guidance)",
+                info="Ask the LLM to enhance the negative prompt too (uses the preset's negative prompt guidance; no-op for flux-dev, flux-krea-dev, z-image-turbo - these models ignore negative prompts)",
                 interactive=True,
                 elem_id=self.elem_id("enhance-negative"),
             )
@@ -665,6 +665,13 @@ class LlamaServerEnhance(scripts.Script):
             _log_to_file(f"  → preset '{resolved}' not found, skipping")
             return
 
+        # Some presets (FLUX / Z-Image) have no negative-prompt conditioning;
+        # enhancing a negative prompt against them would contradict the preset.
+        skip_negatives = negatives_ignored(resolved)
+        if enhance_negative and skip_negatives:
+            print(f"  Llama Enhance: negative enhancement skipped - preset '{resolved}' ignores negative prompts (model has no negative-prompt conditioning)")
+            _log_to_file(f"  → negative enhancement skipped: preset '{resolved}' ignores negative prompts")
+
         # Determine effective output dimensions (final after hires fix)
         hires_enabled = getattr(p, "enable_hr", False)
         final_w, final_h = _get_effective_dimensions(p)
@@ -750,9 +757,10 @@ class LlamaServerEnhance(scripts.Script):
                 )
                 print(f"  Enhanced prompt (full): {enhanced_positive}")
 
-                # Step 2: Enhance negative prompt (if enabled)
+                # Step 2: Enhance negative prompt (if enabled and the preset
+                # actually uses negative prompts)
                 enhanced_negative = original_negative
-                if enhance_negative:
+                if enhance_negative and not skip_negatives:
                     _log_to_file(f"  → Once mode: enhancing negative ({len(original_negative)} chars)")
                     neg_user_prompt = _build_negative_user_prompt(enhanced_positive, original_negative)
                     neg_result: ChatResult = chat_completion_request(
@@ -900,7 +908,7 @@ class LlamaServerEnhance(scripts.Script):
             while len(enhanced_negatives) < len(enhanced_prompts):
                 enhanced_negatives.append("")
 
-            if enhance_negative and successful_indices:
+            if enhance_negative and not skip_negatives and successful_indices:
                 neg_prompts: list[tuple[int, str]] = []
                 for idx in successful_indices:
                     original_negative = p.all_negative_prompts[idx] if idx < len(p.all_negative_prompts) else ""

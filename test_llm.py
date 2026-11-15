@@ -53,7 +53,13 @@ from prompt_enhancer.llm import (
     enhance_prompt,
     spawn_healthy_server,
 )
-from prompt_enhancer.presets import list_presets, load_preset, PRESETS_DIR
+from prompt_enhancer.presets import (
+    NEGATIVES_IGNORED_PRESETS,
+    list_presets,
+    load_preset,
+    negatives_ignored,
+    PRESETS_DIR,
+)
 
 
 def _print_header(text: str):
@@ -81,6 +87,17 @@ def test_preset_loading():
         print("\n  No presets found. Create a .txt file in the presets/ directory.")
         print(f"  e.g.  {PRESETS_DIR / 'default.txt'}")
         return None
+
+    # The negatives-ignored set must only reference presets that exist,
+    # otherwise a renamed preset would silently stop the skip behavior.
+    missing = [name for name in sorted(NEGATIVES_IGNORED_PRESETS) if name not in presets]
+    if missing:
+        print(f"\n  ERROR: NEGATIVES_IGNORED_PRESETS references unknown preset(s): {missing}")
+        sys.exit(1)
+    print(f"  Negatives-ignored presets (negative enhancement is skipped for these): {sorted(NEGATIVES_IGNORED_PRESETS)}")
+    if not (negatives_ignored("flux-dev") and not negatives_ignored("anima")):
+        print("  ERROR: negatives_ignored() predicates wrong")
+        sys.exit(1)
 
     return presets
 
