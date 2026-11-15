@@ -801,122 +801,124 @@ class LlamaServerEnhance(scripts.Script):
 
         base_url = sp.base_url
 
-        # Discover the loaded model name
-        model_name = _discover_model_name(base_url)
-        _log_to_file(f"  Discovered model: {model_name}")
+        try:
+            # Discover the loaded model name
+            model_name = _discover_model_name(base_url)
+            _log_to_file(f"  Discovered model: {model_name}")
 
-        # Discover how many parallel slots the server has
-        slot_count = _discover_slot_count(base_url, model_name)
-        _log_to_file(f"  Discovered {slot_count} slot(s)")
+            # Discover how many parallel slots the server has
+            slot_count = _discover_slot_count(base_url, model_name)
+            _log_to_file(f"  Discovered {slot_count} slot(s)")
 
-        print(f"  Model: {model_name}, Slots: {slot_count}")
+            print(f"  Model: {model_name}, Slots: {slot_count}")
 
-        # Warm up the chat endpoint — /health returns 200 before parallel slots
-        # are initialized, causing HTTP 400 on the first real request.
-        # Warm up exactly as many slots as the server has.
-        _warmup_chat_endpoint(base_url, model_name, num_slots=slot_count)
+            # Warm up the chat endpoint — /health returns 200 before parallel slots
+            # are initialized, causing HTTP 400 on the first real request.
+            # Warm up exactly as many slots as the server has.
+            _warmup_chat_endpoint(base_url, model_name, num_slots=slot_count)
 
-        # --- Step 1: Batch enhance positive prompts ---
-        # Prompts run in strict buckets of slot_count. Each bucket after the
-        # first receives the previous bucket's prompts as a "do not repeat,
-        # vary" reference so similar inputs don't collapse into clones.
-        num_buckets = (len(prompts_to_enhance) + slot_count - 1) // slot_count
-        print(
-            f"  Sending {len(prompts_to_enhance)} positive prompt(s) "
-            f"({slot_count} concurrent, {num_buckets} bucket(s)) ..."
-        )
-        _log_to_file(f"  → positive batch: {len(prompts_to_enhance)} prompt(s) in {num_buckets} bucket(s) of {slot_count}, cross-bucket variance enabled")
-        pos_results = _batch_chat_completions(
-            base_url, model_name, system_prompt, prompts_to_enhance,
-            max_concurrent=slot_count,
-            request_timeout=request_timeout,
-            vary_across_buckets=True,
-        )
-        pos_result_map: dict[int, ChatResult] = {idx: result for idx, result in pos_results}
-
-        # Build enhanced positive list + track which indices succeeded
-        enhanced_prompts: list[str] = [""] * len(p.all_prompts)
-        successful_indices: list[int] = []
-
-        for idx, original in enumerate(p.all_prompts):
-            if idx in skipped_indices:
-                enhanced_prompts[idx] = original
-                continue
-
-            result = pos_result_map.get(idx)
-            if result and result.content:
-                _log_to_file(
-                    f"  → prompt {idx}: positive enhanced ({len(result.content)} chars, "
-                    f"{result.completion_tokens} tokens, {result.generation_tps:.1f} tok/s, "
-                    f"{result.total_ms:.0f}ms total)"
-                )
-
-                # Escape accidental DP syntax in the enhanced prompt
-                escaped_content = _escape_accidental_dp_syntax(original, result.content)
-
-                logger.info("Prompt %d enhanced: %s → %s", idx + 1, original[:60], escaped_content[:60])
-                print(f"  Enhanced prompt {idx + 1} (full): {escaped_content}")
-                enhanced_prompts[idx] = escaped_content
-                successful_indices.append(idx)
-            else:
-                error_detail = result.error if result and result.error else "no result"
-                _log_to_file(f"  → prompt {idx}: positive enhancement failed ({error_detail}), keeping original")
-                logger.info("Prompt %d: using original (enhancement failed: %s)", idx + 1, error_detail)
-                print(f"  Prompt {idx + 1}: using original (enhancement failed: {error_detail})")
-                enhanced_prompts[idx] = original
-
-        # --- Step 2: Batch enhance negative prompts (if enabled) ---
-        # Start with original negatives as baseline (pad with empty strings if needed)
-        enhanced_negatives: list[str] = list(p.all_negative_prompts)
-        while len(enhanced_negatives) < len(enhanced_prompts):
-            enhanced_negatives.append("")
-
-        if enhance_negative and successful_indices:
-            neg_prompts: list[tuple[int, str]] = []
-            for idx in successful_indices:
-                original_negative = p.all_negative_prompts[idx] if idx < len(p.all_negative_prompts) else ""
-                neg_user_prompt = _build_negative_user_prompt(enhanced_prompts[idx], original_negative)
-                neg_prompts.append((idx, neg_user_prompt))
-
+            # --- Step 1: Batch enhance positive prompts ---
+            # Prompts run in strict buckets of slot_count. Each bucket after the
+            # first receives the previous bucket's prompts as a "do not repeat,
+            # vary" reference so similar inputs don't collapse into clones.
+            num_buckets = (len(prompts_to_enhance) + slot_count - 1) // slot_count
             print(
-                f"  Sending {len(neg_prompts)} negative prompt(s) "
-                f"({slot_count} concurrent) ..."
+                f"  Sending {len(prompts_to_enhance)} positive prompt(s) "
+                f"({slot_count} concurrent, {num_buckets} bucket(s)) ..."
             )
-            neg_results = _batch_chat_completions(
-                base_url, model_name, negative_system_prompt, neg_prompts,
+            _log_to_file(f"  → positive batch: {len(prompts_to_enhance)} prompt(s) in {num_buckets} bucket(s) of {slot_count}, cross-bucket variance enabled")
+            pos_results = _batch_chat_completions(
+                base_url, model_name, system_prompt, prompts_to_enhance,
                 max_concurrent=slot_count,
                 request_timeout=request_timeout,
+                vary_across_buckets=True,
             )
-            neg_result_map: dict[int, ChatResult] = {idx: result for idx, result in neg_results}
+            pos_result_map: dict[int, ChatResult] = {idx: result for idx, result in pos_results}
 
-            for idx in successful_indices:
-                original_negative = p.all_negative_prompts[idx] if idx < len(p.all_negative_prompts) else ""
-                result = neg_result_map.get(idx)
+            # Build enhanced positive list + track which indices succeeded
+            enhanced_prompts: list[str] = [""] * len(p.all_prompts)
+            successful_indices: list[int] = []
+
+            for idx, original in enumerate(p.all_prompts):
+                if idx in skipped_indices:
+                    enhanced_prompts[idx] = original
+                    continue
+
+                result = pos_result_map.get(idx)
                 if result and result.content:
                     _log_to_file(
-                        f"  → prompt {idx}: negative enhanced ({len(result.content)} chars, "
+                        f"  → prompt {idx}: positive enhanced ({len(result.content)} chars, "
                         f"{result.completion_tokens} tokens, {result.generation_tps:.1f} tok/s, "
                         f"{result.total_ms:.0f}ms total)"
                     )
 
-                    # Escape accidental DP syntax in the enhanced negative prompt
-                    escaped_negative = _escape_accidental_dp_syntax(original_negative, result.content)
+                    # Escape accidental DP syntax in the enhanced prompt
+                    escaped_content = _escape_accidental_dp_syntax(original, result.content)
 
-                    logger.info("Negative %d enhanced: %s → %s", idx + 1, original_negative[:60], escaped_negative[:60])
-                    print(f"  Enhanced negative {idx + 1} (full): {escaped_negative}")
-                    enhanced_negatives[idx] = escaped_negative
-                # else: keep original negative (already set as baseline)
+                    logger.info("Prompt %d enhanced: %s → %s", idx + 1, original[:60], escaped_content[:60])
+                    print(f"  Enhanced prompt {idx + 1} (full): {escaped_content}")
+                    enhanced_prompts[idx] = escaped_content
+                    successful_indices.append(idx)
+                else:
+                    error_detail = result.error if result and result.error else "no result"
+                    _log_to_file(f"  → prompt {idx}: positive enhancement failed ({error_detail}), keeping original")
+                    logger.info("Prompt %d: using original (enhancement failed: %s)", idx + 1, error_detail)
+                    print(f"  Prompt {idx + 1}: using original (enhancement failed: {error_detail})")
+                    enhanced_prompts[idx] = original
 
-        # Kill the server and capture stderr for diagnostics
-        _kill_server(sp)
-        stderr_tail = sp.stderr_tail(3000)
-        if stderr_tail.strip():
-            _log_to_file(f"  llama-server stderr (last 3000 chars):\n{stderr_tail}")
+            # --- Step 2: Batch enhance negative prompts (if enabled) ---
+            # Start with original negatives as baseline (pad with empty strings if needed)
+            enhanced_negatives: list[str] = list(p.all_negative_prompts)
+            while len(enhanced_negatives) < len(enhanced_prompts):
+                enhanced_negatives.append("")
 
-        p.all_prompts = enhanced_prompts
-        p.all_negative_prompts = enhanced_negatives
-        _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
-        _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
+            if enhance_negative and successful_indices:
+                neg_prompts: list[tuple[int, str]] = []
+                for idx in successful_indices:
+                    original_negative = p.all_negative_prompts[idx] if idx < len(p.all_negative_prompts) else ""
+                    neg_user_prompt = _build_negative_user_prompt(enhanced_prompts[idx], original_negative)
+                    neg_prompts.append((idx, neg_user_prompt))
+
+                print(
+                    f"  Sending {len(neg_prompts)} negative prompt(s) "
+                    f"({slot_count} concurrent) ..."
+                )
+                neg_results = _batch_chat_completions(
+                    base_url, model_name, negative_system_prompt, neg_prompts,
+                    max_concurrent=slot_count,
+                    request_timeout=request_timeout,
+                )
+                neg_result_map: dict[int, ChatResult] = {idx: result for idx, result in neg_results}
+
+                for idx in successful_indices:
+                    original_negative = p.all_negative_prompts[idx] if idx < len(p.all_negative_prompts) else ""
+                    result = neg_result_map.get(idx)
+                    if result and result.content:
+                        _log_to_file(
+                            f"  → prompt {idx}: negative enhanced ({len(result.content)} chars, "
+                            f"{result.completion_tokens} tokens, {result.generation_tps:.1f} tok/s, "
+                            f"{result.total_ms:.0f}ms total)"
+                        )
+
+                        # Escape accidental DP syntax in the enhanced negative prompt
+                        escaped_negative = _escape_accidental_dp_syntax(original_negative, result.content)
+
+                        logger.info("Negative %d enhanced: %s → %s", idx + 1, original_negative[:60], escaped_negative[:60])
+                        print(f"  Enhanced negative {idx + 1} (full): {escaped_negative}")
+                        enhanced_negatives[idx] = escaped_negative
+                    # else: keep original negative (already set as baseline)
+
+            p.all_prompts = enhanced_prompts
+            p.all_negative_prompts = enhanced_negatives
+            _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
+            _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
+        finally:
+            # Always kill the server: an unexpected exception above must not
+            # leak a GPU-resident llama-server (or its port) until restart.
+            _kill_server(sp)
+            stderr_tail = sp.stderr_tail(3000)
+            if stderr_tail.strip():
+                _log_to_file(f"  llama-server stderr (last 3000 chars):\n{stderr_tail}")
 
     def postprocess(self, p, processed, enable, *args):
         """Called after all processing ends. Unload SD models to free VRAM."""
