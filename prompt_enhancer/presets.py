@@ -24,6 +24,19 @@ FLUX_CHECKPOINT_OVERRIDES: list[tuple[str, str]] = [
     ("krea", "flux-krea-dev"),
 ]
 
+# Presets whose system prompt explicitly forbids negative prompts (FLUX and
+# Z-Image models have no negative-prompt conditioning). Enhancing a negative
+# prompt against these presets contradicts the preset, so the negative step
+# is skipped with a console notice instead.
+NEGATIVES_IGNORED_PRESETS: frozenset[str] = frozenset(
+    {"flux-dev", "flux-krea-dev", "z-image-turbo"}
+)
+
+
+def negatives_ignored(name: str) -> bool:
+    """True if the named preset's model ignores negative prompts."""
+    return name in NEGATIVES_IGNORED_PRESETS
+
 
 def list_presets() -> list[str]:
     """Return sorted list of preset names (filenames without .txt extension)."""

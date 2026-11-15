@@ -16,6 +16,8 @@ Run:  python test_batching.py   (exit code 0 on pass)
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sys
 import threading
@@ -29,8 +31,11 @@ sys.path.insert(0, str(_SCRIPT_DIR))
 
 from prompt_enhancer.llm import (
     _batch_chat_completions,
+    _clean_http_error,
+    _describe_error,
     _plan_buckets,
     _variation_reference_block,
+    _wait_for_server,
 )
 
 passed = 0
@@ -150,6 +155,68 @@ def test_reference_block():
     check("collapses whitespace in entries", "1. line1 line2 x" in _variation_reference_block(["line1\nline2  x"]))
 
 
+def test_clean_http_error():
+    print("\n=== _clean_http_error / _describe_error ===")
+    obj_body = json.dumps(
+        {"error": {"message": "prompt 32450 tokens is too long (32000)", "type": "server_error", "code": 400}}
+    )
+    expected = "HTTP 400: prompt 32450 tokens is too long (32000)"
+    check("new-style object body: message extracted, no JSON in output",
+          _clean_http_error(400, obj_body) == expected, _clean_http_error(400, obj_body))
+    legacy_body = json.dumps({"error": "model not found"})
+    check("legacy string body: message extracted",
+          _clean_http_error(404, legacy_body) == "HTTP 404: model not found",
+          _clean_http_error(404, legacy_body))
+    check("non-JSON body: raw text kept",
+          _clean_http_error(500, "internal error: allocation failed") == "HTTP 500: internal error: allocation failed",
+          _clean_http_error(500, "internal error: allocation failed"))
+    check("empty body: status present, no crash", "HTTP 400" in _clean_http_error(400, ""))
+    long_body = json.dumps({"error": {"message": "x" * 500}})
+    check("long message truncated to one line",
+          len(_clean_http_error(400, long_body)) <= 350,
+          str(len(_clean_http_error(400, long_body))))
+
+    from urllib import error as urlerror
+    exc = urlerror.HTTPError(
+        "http://127.0.0.1:1/v1/chat/completions", 400, "Bad Request", None,
+        io.BytesIO(obj_body.encode()),
+    )
+    check("_describe_error(HTTPError) extracts the message", _describe_error(exc) == expected, _describe_error(exc))
+
+
+def test_wait_heartbeat():
+    print("\n=== _wait_for_server heartbeat ===")
+
+    class _UnhealthyHandler(BaseHTTPRequestHandler):
+        # Alive but never healthy: /health always 404s, so the poll loop
+        # spins at its 0.5s sleep cadence (a dead port would be too slow
+        # to time against - refused connects can take ~2s on Windows).
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _UnhealthyHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ok = _wait_for_server(
+                f"http://127.0.0.1:{server.server_address[1]}",
+                timeout=1.6, heartbeat_interval=0.3,
+            )
+        out = buf.getvalue()
+    finally:
+        server.shutdown()
+    check("unhealthy server: returns False", ok is False)
+    check("heartbeat lines printed while waiting", out.count("still loading") >= 2,
+          f"got {out.count('still loading')}: {out!r}")
+
+
 # ---------------------------------------------------------------------------
 # End-to-end against the fake server
 # ---------------------------------------------------------------------------
@@ -242,6 +309,8 @@ def test_failed_bucket_falls_back_to_original():
 def main():
     test_plan_buckets()
     test_reference_block()
+    test_clean_http_error()
+    test_wait_heartbeat()
     test_bucket_barrier_and_reference()
     test_no_reference_by_default()
     test_failed_bucket_falls_back_to_original()

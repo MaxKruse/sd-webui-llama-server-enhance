@@ -107,12 +107,21 @@ def _build_command(
 
 def _wait_for_server(
     base_url: str,
-    timeout: int = _SERVER_STARTUP_TIMEOUT,
+    timeout: float = _SERVER_STARTUP_TIMEOUT,
     proc: subprocess.Popen | None = None,
+    heartbeat_interval: float = 10.0,
 ) -> bool:
     """Poll /health until the server responds, the timeout is reached, or the
-    process exits early (a crashed server can never become healthy)."""
+    process exits early (a crashed server can never become healthy).
+
+    Prints a heartbeat line every heartbeat_interval seconds so a slow model
+    load (up to `timeout` seconds of console silence) looks alive instead of
+    hung. Full load progress stays in the debug log - streaming all of the
+    server's stderr to the console would be noise.
+    """
     deadline = time.monotonic() + timeout
+    start = time.monotonic()
+    next_heartbeat = start + heartbeat_interval
     url = f"{base_url}/health"
 
     while time.monotonic() < deadline:
@@ -125,6 +134,9 @@ def _wait_for_server(
                     return True
         except (error.URLError, ConnectionError, OSError):
             pass
+        if time.monotonic() >= next_heartbeat:
+            print(f"  ... still loading ({time.monotonic() - start:.0f}s / {timeout:.0f}s)")
+            next_heartbeat += heartbeat_interval
         time.sleep(0.5)
 
     return False
@@ -313,20 +325,18 @@ _print_lock = Lock()
 
 class ChatResult:
     """Result from a single chat completion, including timing stats."""
-    __slots__ = ("content", "prompt_tokens", "completion_tokens", "prompt_ms", "predicted_ms", "error")
+    __slots__ = ("content", "completion_tokens", "prompt_ms", "predicted_ms", "error")
 
     def __init__(
         self,
         content: str | None = None,
         *,
-        prompt_tokens: int = 0,
         completion_tokens: int = 0,
         prompt_ms: float = 0.0,
         predicted_ms: float = 0.0,
         error: str | None = None,
     ):
         self.content = content
-        self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.prompt_ms = prompt_ms
         self.predicted_ms = predicted_ms
@@ -484,19 +494,46 @@ def _retry_backoff(attempt: int) -> float:
     return min(3 * (2 ** (attempt - 1)), 30)
 
 
+def _clean_http_error(status: int, body: str) -> str:
+    """One-line human-readable description of an HTTP error response.
+
+    llama-server returns OpenAI-style error bodies: ``{"error": {"message": ...}}``
+    (newer builds) or ``{"error": "message"}`` (older). Dumping the raw JSON
+    into the console on every retry attempt is noise, so the message is
+    extracted; unparseable bodies fall back to a short raw truncation.
+    """
+    try:
+        data = json.loads(body)
+    except ValueError:
+        data = None
+    message = None
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict):
+            candidate = err.get("message")
+            if isinstance(candidate, str):
+                message = candidate
+        elif isinstance(err, str):
+            message = err
+    if message and message.strip():
+        return f"HTTP {status}: {message.strip()[:300]}"
+    raw = body.strip()[:200]
+    return f"HTTP {status}: {raw}" if raw else f"HTTP {status}: <empty error body>"
+
+
 def _describe_error(exc: BaseException) -> str:
     """One-line description of a chat-completion failure.
 
     Shared by the sync (urllib) and async (aiohttp) retry loops. For
-    HTTP errors the response body is included (truncated) because it
-    usually carries the real reason (context overflow, bad request, ...).
+    HTTP errors the response body is parsed into the server's one-line
+    message (see _clean_http_error) because the raw JSON body is noise.
     """
     if isinstance(exc, error.HTTPError):
         try:
             body = exc.read().decode("utf-8", errors="replace")
         except Exception:
             body = "<unreadable>"
-        return f"HTTP {exc.code}: {body[:500]}"
+        return _clean_http_error(exc.code, body)
     return f"{type(exc).__name__}: {exc}"
 
 
@@ -547,7 +584,6 @@ def _chat_completion(
 
                 # Extract token counts from usage
                 usage = result.get("usage", {})
-                prompt_tokens = usage.get("prompt_tokens", usage.get("prompt_n", 0))
                 completion_tokens = usage.get("completion_tokens", usage.get("predicted_n", 0))
 
                 # Extract timing from the timings block (llama-server)
@@ -557,7 +593,6 @@ def _chat_completion(
 
                 return ChatResult(
                     content=content.strip() if content else None,
-                    prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     prompt_ms=prompt_ms,
                     predicted_ms=predicted_ms,
@@ -626,9 +661,11 @@ async def _chat_completion_async(
                     resp.raise_for_status()
                 except aiohttp.ClientResponseError:
                     # Response is still open: read the body for diagnostics.
-                    # (ClientResponseError does not expose it.)
+                    # (ClientResponseError does not expose it.) Read enough to
+                    # cover the full JSON error object so _clean_http_error can
+                    # parse it (localhost traffic - size is irrelevant).
                     try:
-                        http_error_body = (await resp.read()).decode("utf-8", errors="replace")[:500]
+                        http_error_body = (await resp.read()).decode("utf-8", errors="replace")[:2000]
                     except Exception:
                         http_error_body = "<unreadable>"
                     raise
@@ -636,7 +673,6 @@ async def _chat_completion_async(
                 content = result["choices"][0]["message"]["content"]
 
                 usage = result.get("usage", {})
-                prompt_tokens = usage.get("prompt_tokens", usage.get("prompt_n", 0))
                 completion_tokens = usage.get("completion_tokens", usage.get("predicted_n", 0))
 
                 timings = result.get("timings", {})
@@ -645,7 +681,6 @@ async def _chat_completion_async(
 
                 chat_result = ChatResult(
                     content=content.strip() if content else None,
-                    prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     prompt_ms=prompt_ms,
                     predicted_ms=predicted_ms,
@@ -653,17 +688,19 @@ async def _chat_completion_async(
                 break  # Success
         except aiohttp.ClientResponseError as exc:
             failed_exc = exc
-            last_error = f"HTTP {exc.status}: {http_error_body}"
+            last_error = _clean_http_error(exc.status, http_error_body)
         except Exception as exc:
             failed_exc = exc
             last_error = _describe_error(exc)
         else:
             continue  # unreachable: the success path breaks above
 
-        # A request failed on this attempt - log, decide on retry.
-        logger.error("Chat completion request failed (attempt %d/%d): %s", attempt, _MAX_CHAT_RETRIES, last_error)
+        # A request failed on this attempt - log, decide on retry. The index
+        # is included because bucket requests fail concurrently and the lines
+        # would otherwise be indistinguishable.
+        logger.error("Prompt %d: request failed (attempt %d/%d): %s", index + 1, attempt, _MAX_CHAT_RETRIES, last_error)
         with _print_lock:
-            print(f"  Chat completion request failed (attempt {attempt}/{_MAX_CHAT_RETRIES}): {last_error}")
+            print(f"  Prompt {index + 1}: request failed (attempt {attempt}/{_MAX_CHAT_RETRIES}): {last_error}")
 
         if not _is_transient_error(failed_exc):
             logger.error("Error is not transient - not retrying")
