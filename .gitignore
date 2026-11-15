@@ -1,5 +1,5 @@
 # Debug logs
-enhance_debug.log
+enhance_debug.log*
 
 # Python
 __pycache__/
