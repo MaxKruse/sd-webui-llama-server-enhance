@@ -489,14 +489,23 @@ class LlamaServerEnhance(scripts.Script):
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
+        # The accordion's open state doubles as the enable flag (A1111
+        # InputAccordion pattern): tell users explicitly, because a closed
+        # accordion silently disables the extension for the next generation.
+        gr.HTML(
+            value="<small>LLM enhancement runs while this accordion is <b>open</b>. "
+            "Closing it disables the extension for the next generation.</small>",
+            elem_id=self.elem_id("enable-hint"),
+        )
         with InputAccordion(
             value=False,
             label="LLama Server Enhance",
             elem_id=self.elem_id("main-accordion"),
         ) as enable:
             gr.HTML(
-                value="<small>Preset is auto-selected based on the Forge-Neo UI preset "
-                "(flux→flux-dev, zit→z-image-turbo, anima→anima).</small>",
+                value="<small>Preset is auto-selected from the Forge-Neo UI preset: "
+                "flux→flux-dev (krea checkpoints→flux-krea-dev), zit→z-image-turbo, "
+                "anima→anima. Other Forge presets have no LLM preset - enhancement is skipped.</small>",
                 elem_id=self.elem_id("preset-info"),
             )
             enhance_mode = gr.Dropdown(
