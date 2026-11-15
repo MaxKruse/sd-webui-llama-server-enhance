@@ -14,6 +14,8 @@ Drop this extension into your `extensions/` folder and get per-image prompt enha
   - **Per image** - enhance each prompt individually (batch-optimized: one server, strict buckets of the server's slot count, cross-bucket variation so similar prompts don't clone)
   - **Once** - enhance one prompt and apply it to all images in the batch
 - **Test server button** - in the UI accordion: validates the binary, model file, and inference flags with a live spawn + health check + small chat request, without generating anything
+- **Accordion open = enabled** - enhancement runs only while the "LLama Server Enhance" accordion is open; closing it disables the extension for the next generation
+- **Visible skips** - if the Forge UI preset has no LLM preset mapping, the preset file is missing, the model path is unset, or the preset ignores negative prompts, the extension prints the reason in the console instead of skipping silently
 - **OpenAI-compatible API** - works with any model that `llama-server` can load
 
 ## Installation
@@ -55,6 +57,10 @@ The preset is automatically selected based on the Forge-Neo UI preset:
 | `zit` | `z-image-turbo` |
 | `anima` | `anima` |
 
+Any other Forge-Neo preset (sd, xl, lumina, wan, ...) has no LLM preset - enhancement is skipped for that generation with a console notice naming the Forge preset.
+
+For `flux-dev`, `flux-krea-dev` and `z-image-turbo` the *Also enhance negative prompt* option is a no-op: those models ignore negative prompts, so the negative step is skipped with a console notice.
+
 Included presets:
 - `presets/anima.txt` - for the [Anima](https://github.com/CircleStone-Labs/Anima) anime model. Enforces *scene completeness*: every enhanced output must include mood, lighting, environment, movement/pose, and character-environment interaction - the LLM invents fitting details for anything the user's prompt leaves unspecified. Runs *uncensored*: prompts with sexual or sensual intent are enhanced to be fully explicit (clothing removed, `nsfw, explicit` tags, direct anatomical description in the natural-language part), and the `safe` tag is never emitted in the positive - for adult content it is pushed into the negative alongside `sensitive` instead, because Anima's safety tags steer content in both directions
 - `presets/flux-dev.txt` - for FLUX.1 [dev]
@@ -65,7 +71,7 @@ Included presets:
 
 ### Per image (default)
 
-Each prompt in the batch is enhanced individually. The extension starts **one** `llama-server` instance and sends the positive prompts in **strict buckets** sized to the server's parallel slot count (e.g. 4 concurrent): a whole bucket must finish before the next bucket starts. When more than one bucket runs, each bucket after the first receives the previous bucket's prompts (the enhanced text actually used, or the original after a failure) as a *variation reference* - the LLM is instructed not to repeat them exactly and to introduce fresh variance (mood, lighting, environment, pose, composition) while staying faithful to your original intent. This keeps large batches of similar prompts from collapsing into near-identical images. Negative prompts are batched the same way, without variation references.
+Each prompt in the batch is enhanced individually. The extension starts **one** `llama-server` instance and sends the positive prompts in **strict buckets** sized to the server's parallel slot count (e.g. 4 concurrent): a whole bucket must finish before the next bucket starts. When more than one bucket runs, each bucket after the first receives the previous bucket's prompts (the enhanced text actually used, or the original after a failure) as a *variation reference* - the LLM is instructed not to repeat them exactly and to introduce fresh variance (mood, lighting, environment, pose, composition) while staying faithful to your original intent. This keeps large batches of similar prompts from collapsing into near-identical images. Negative prompts are batched the same way, without variation references - unless the resolved preset ignores negative prompts (flux-dev, flux-krea-dev, z-image-turbo: these models have no negative-prompt conditioning), in which case the step is skipped with a console notice.
 
 ### Once
 
@@ -109,7 +115,7 @@ This ensures the LLM can freely describe things like "a cat or dog" without the 
 
 1. Find a free TCP port in the ephemeral range (49152-65535)
 2. Start `llama-server` on that port with `--no-ui --no-warmup`
-3. Poll `/health` until the model is loaded and ready (configurable startup timeout, default 60s, aborts early if the process exits)
+3. Poll `/health` until the model is loaded and ready (configurable startup timeout, default 60s, aborts early if the process exits; a `... still loading (Ns / Ms)` status line prints every 10s so a slow load doesn't look hung)
 4. Send the positive prompt - and the negative prompt too, if enabled - via `/v1/chat/completions`, both against the same server
 5. Kill the server process
 
@@ -117,7 +123,7 @@ This ensures the LLM can freely describe things like "a cat or dog" without the 
 
 1. Find a free TCP port
 2. Start **one** `llama-server` instance
-3. Wait for `/health` (once), discover the slot count via `/slots`, warm up the chat endpoint
+3. Wait for `/health` (with a periodic `... still loading (Ns / Ms)` line while the model loads), discover the slot count via `/slots`, warm up the chat endpoint
 4. Send the positive prompts in **strict buckets** - each bucket finishes before the next starts. The bucket size (= max concurrent LLM requests) comes from the *Bucket size (Per image mode)* dropdown in the accordion; *Auto (server slots)* - the default - uses the discovered slot count
 5. Each bucket after the first gets the previous bucket's prompts appended to the system prompt as a "do not repeat exactly, introduce variance" reference
 6. Batch the negative prompts (if enabled), same bucketing, no variation reference
@@ -129,6 +135,7 @@ This avoids the Nxstartup penalty of spawning a new server per prompt, and the b
 
 - **Pipe draining** - the server's stdout/stderr are continuously drained by background threads into bounded in-memory buffers (last 256KB kept). Without draining, the OS pipe buffer (4KB on Windows) fills up as the server logs its startup and every task, and the server's own threads block on write: `/health` keeps answering while chat requests hang. This was the root cause of intermittent "server is healthy but times out" behavior.
 - **Transient-only retries** - failed requests get up to 5 total attempts (3s/6s/12s/24s backoff between attempts), but only for transient errors (timeouts, connection failures, HTTP 408/429/5xx, truncated responses). Deterministic 4xx errors (e.g., context overflow) fail immediately instead of burning ~45s of retries.
+- **One-line error messages** - failures are reported in the console as the server's own message parsed from the JSON error body (e.g. `HTTP 400: prompt 32450 tokens is too long (32000)`), with the prompt index for batch requests - not the raw 500-character JSON dump. The full body remains in `enhance_debug.log`.
 - **Per-request timeout** - each chat request times out after the configured *Request timeout* (default 120s), not after the whole retry budget.
 
 ## Test Script
