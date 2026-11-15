@@ -789,6 +789,11 @@ class LlamaServerEnhance(scripts.Script):
                 _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
             finally:
                 _kill_server(sp)
+            # Every Once-mode path exits here (failure paths return inside the
+            # try). Without this return the success path would fall through
+            # into Per-image mode and re-enhance the already-enhanced prompts
+            # with a second server.
+            return
 
         # "Per image" mode: start ONE server, batch positives, then batch negatives
         _log_to_file(f"  → Per image mode: {len(p.all_prompts)} prompt(s)")
