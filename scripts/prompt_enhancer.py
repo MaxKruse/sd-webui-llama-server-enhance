@@ -602,7 +602,7 @@ class LlamaServerEnhance(scripts.Script):
         _free_gpu_memory()
         sp = _spawn_healthy_server(server_path, model_path, extra_flags, label=" (test)")
         if sp is None:
-            msg = "Server: FAILED - did not become healthy. See enhance_debug.log for the server's stderr."
+            msg = f"Server: FAILED - did not become healthy. See {_LOG_FILE} for the server's stderr."
             _log_to_file(f"  → {msg}")
             return "\n".join([*lines, msg])
 
