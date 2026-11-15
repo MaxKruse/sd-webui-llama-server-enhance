@@ -313,20 +313,18 @@ _print_lock = Lock()
 
 class ChatResult:
     """Result from a single chat completion, including timing stats."""
-    __slots__ = ("content", "prompt_tokens", "completion_tokens", "prompt_ms", "predicted_ms", "error")
+    __slots__ = ("content", "completion_tokens", "prompt_ms", "predicted_ms", "error")
 
     def __init__(
         self,
         content: str | None = None,
         *,
-        prompt_tokens: int = 0,
         completion_tokens: int = 0,
         prompt_ms: float = 0.0,
         predicted_ms: float = 0.0,
         error: str | None = None,
     ):
         self.content = content
-        self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
         self.prompt_ms = prompt_ms
         self.predicted_ms = predicted_ms
@@ -574,7 +572,6 @@ def _chat_completion(
 
                 # Extract token counts from usage
                 usage = result.get("usage", {})
-                prompt_tokens = usage.get("prompt_tokens", usage.get("prompt_n", 0))
                 completion_tokens = usage.get("completion_tokens", usage.get("predicted_n", 0))
 
                 # Extract timing from the timings block (llama-server)
@@ -584,7 +581,6 @@ def _chat_completion(
 
                 return ChatResult(
                     content=content.strip() if content else None,
-                    prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     prompt_ms=prompt_ms,
                     predicted_ms=predicted_ms,
@@ -665,7 +661,6 @@ async def _chat_completion_async(
                 content = result["choices"][0]["message"]["content"]
 
                 usage = result.get("usage", {})
-                prompt_tokens = usage.get("prompt_tokens", usage.get("prompt_n", 0))
                 completion_tokens = usage.get("completion_tokens", usage.get("predicted_n", 0))
 
                 timings = result.get("timings", {})
@@ -674,7 +669,6 @@ async def _chat_completion_async(
 
                 chat_result = ChatResult(
                     content=content.strip() if content else None,
-                    prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     prompt_ms=prompt_ms,
                     predicted_ms=predicted_ms,
