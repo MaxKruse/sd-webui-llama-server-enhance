@@ -118,17 +118,17 @@ This ensures the LLM can freely describe things like "a cat or dog" without the 
 1. Find a free TCP port
 2. Start **one** `llama-server` instance
 3. Wait for `/health` (once), discover the slot count via `/slots`, warm up the chat endpoint
-4. Send the positive prompts in **strict buckets** of the slot count - each bucket finishes before the next starts
+4. Send the positive prompts in **strict buckets** - each bucket finishes before the next starts. The bucket size (= max concurrent LLM requests) comes from the *Bucket size (Per image mode)* dropdown in the accordion; *Auto (server slots)* - the default - uses the discovered slot count
 5. Each bucket after the first gets the previous bucket's prompts appended to the system prompt as a "do not repeat exactly, introduce variance" reference
 6. Batch the negative prompts (if enabled), same bucketing, no variation reference
 7. Kill the server
 
-This avoids the Nxstartup penalty of spawning a new server per prompt, and the bucketing keeps multi-bucket jobs varied instead of repetitive.
+This avoids the Nxstartup penalty of spawning a new server per prompt, and the bucketing keeps multi-bucket jobs varied instead of repetitive. A user-chosen bucket size smaller than the slot count trades a little throughput for more variance-reference churn (the "do not repeat" reference refreshes per bucket). Choosing more buckets than the server has slots is allowed - the extra requests queue inside the server.
 
 ### Reliability details
 
 - **Pipe draining** - the server's stdout/stderr are continuously drained by background threads into bounded in-memory buffers (last 256KB kept). Without draining, the OS pipe buffer (4KB on Windows) fills up as the server logs its startup and every task, and the server's own threads block on write: `/health` keeps answering while chat requests hang. This was the root cause of intermittent "server is healthy but times out" behavior.
-- **Transient-only retries** - failed requests are retried up to 5 times (3s/6s/12s/24s backoff), but only for transient errors (timeouts, connection failures, HTTP 408/429/5xx, truncated responses). Deterministic 4xx errors (e.g., context overflow) fail immediately instead of burning ~45s of retries.
+- **Transient-only retries** - failed requests get up to 5 total attempts (3s/6s/12s/24s backoff between attempts), but only for transient errors (timeouts, connection failures, HTTP 408/429/5xx, truncated responses). Deterministic 4xx errors (e.g., context overflow) fail immediately instead of burning ~45s of retries.
 - **Per-request timeout** - each chat request times out after the configured *Request timeout* (default 120s), not after the whole retry budget.
 
 ## Test Script
@@ -160,6 +160,9 @@ python test_llm.py --server C:/tools/llamacpp/llama-server.exe \
 
 # Override the per-request timeout (seconds)
 python test_llm.py --preset anima --model C:/models/my-model.gguf --timeout 60
+
+# Override the server startup timeout (seconds)
+python test_llm.py --preset anima --model C:/models/my-model.gguf --startup-timeout 120
 ```
 
 ## Debugging

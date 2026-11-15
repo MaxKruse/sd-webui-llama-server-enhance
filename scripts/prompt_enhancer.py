@@ -469,8 +469,12 @@ def _effective_negative_system_prompt(
 class LlamaServerEnhance(scripts.Script):
     """Enhance positive prompts through a local LLM (llama-server)."""
 
-    # Run BEFORE sd-dynamic-prompts (priority 1000) so we enhance the raw
-    # prompt (with wildcards/variants intact), then DP expands them.
+    # NOTE: sorting_priority only orders this always-visible UI accordion
+    # section - it does NOT control process() call order. Forge invokes
+    # process() in extension discovery order (alphabetical), so
+    # sd-dynamic-prompts normally expands wildcards BEFORE we enhance.
+    # To enhance raw prompts first, pin this script above "Script" in
+    # Settings -> "Script process callback priority".
     sorting_priority = 999
 
     def title(self):
