@@ -107,6 +107,21 @@ def _read_startup_timeout() -> float:
         return float(_SERVER_STARTUP_TIMEOUT)
 
 
+# Bucket-size dropdown choices for "Per image" mode. The Auto choice means
+# "use the server's parallel slot count" (discovered from /slots at run time).
+BUCKET_SIZE_AUTO = "Auto (server slots)"
+BUCKET_SIZE_CHOICES = [BUCKET_SIZE_AUTO, "1", "2", "3", "4", "5", "6", "8", "10", "16"]
+
+
+def _parse_bucket_size(raw) -> int:
+    """Parse the bucket-size dropdown value; returns 0 for auto/invalid."""
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return 0
+    return max(1, value)
+
+
 def _spawn_healthy_server(
     server_path: str,
     model_path: str,
@@ -483,6 +498,14 @@ class LlamaServerEnhance(scripts.Script):
                 interactive=True,
                 elem_id=self.elem_id("enhance-mode"),
             )
+            bucket_size = gr.Dropdown(
+                choices=BUCKET_SIZE_CHOICES,
+                value=BUCKET_SIZE_AUTO,
+                label="Bucket size (Per image mode)",
+                info="Prompts per bucket = max concurrent LLM requests. Auto = the server's parallel slot count.",
+                interactive=True,
+                elem_id=self.elem_id("bucket-size"),
+            )
             enhance_negative = gr.Checkbox(
                 value=False,
                 label="Also enhance negative prompt",
@@ -490,6 +513,11 @@ class LlamaServerEnhance(scripts.Script):
                 interactive=True,
                 elem_id=self.elem_id("enhance-negative"),
             )
+
+            def _on_mode_change(mode: str):
+                return gr.update(visible=mode != "Once")
+
+            enhance_mode.change(fn=_on_mode_change, inputs=[enhance_mode], outputs=[bucket_size])
 
             test_button = gr.Button("Test server", variant="secondary")
             test_output = gr.Textbox(
@@ -500,7 +528,7 @@ class LlamaServerEnhance(scripts.Script):
             )
             test_button.click(fn=self._test_server, outputs=[test_output])
 
-        return [enable, enhance_mode, enhance_negative]
+        return [enable, enhance_mode, bucket_size, enhance_negative]
 
     def _test_server(self) -> str:
         """UI button handler: validate the configured server without generating."""
@@ -597,11 +625,12 @@ class LlamaServerEnhance(scripts.Script):
         p: StableDiffusionProcessing,
         enable: bool,
         enhance_mode: str,
+        bucket_size: str,
         enhance_negative: bool,
     ):
         """Called once before any sampling. Enhance prompts here."""
         _log_to_file("=" * 72)
-        _log_to_file(f"process() entered — enable={enable!r}, mode={enhance_mode!r}, enhance_negative={enhance_negative!r}")
+        _log_to_file(f"process() entered — enable={enable!r}, mode={enhance_mode!r}, bucket_size={bucket_size!r}, enhance_negative={enhance_negative!r}")
         _log_to_file(f"  p.all_prompts (input)  = {p.all_prompts!r}")
         _log_to_file(f"  p.all_negative_prompts (input) = {p.all_negative_prompts!r}")
         _log_to_file(f"  p.n_iter = {p.n_iter}, p.batch_size = {p.batch_size}")
@@ -795,7 +824,17 @@ class LlamaServerEnhance(scripts.Script):
             slot_count = _discover_slot_count(base_url, model_name)
             _log_to_file(f"  Discovered {slot_count} slot(s)")
 
-            print(f"  Model: {model_name}, Slots: {slot_count}")
+            # Resolve the effective bucket size (max concurrent LLM requests
+            # per bucket). The dropdown's Auto choice maps to the slot count.
+            bucket = _parse_bucket_size(bucket_size)
+            if bucket == 0:
+                bucket = slot_count
+                _log_to_file(f"  bucket size: auto → {slot_count} (server slots)")
+            else:
+                suffix = f" (server has {slot_count} slots - requests will queue)" if bucket > slot_count else ""
+                _log_to_file(f"  bucket size: user choice {bucket}{suffix}")
+
+            print(f"  Model: {model_name}, Slots: {slot_count}, Bucket: {bucket}")
 
             # Warm up the chat endpoint — /health returns 200 before parallel slots
             # are initialized, causing HTTP 400 on the first real request.
@@ -806,15 +845,15 @@ class LlamaServerEnhance(scripts.Script):
             # Prompts run in strict buckets of slot_count. Each bucket after the
             # first receives the previous bucket's prompts as a "do not repeat,
             # vary" reference so similar inputs don't collapse into clones.
-            num_buckets = (len(prompts_to_enhance) + slot_count - 1) // slot_count
+            num_buckets = (len(prompts_to_enhance) + bucket - 1) // bucket
             print(
                 f"  Sending {len(prompts_to_enhance)} positive prompt(s) "
-                f"({slot_count} concurrent, {num_buckets} bucket(s)) ..."
+                f"({bucket} concurrent, {num_buckets} bucket(s)) ..."
             )
-            _log_to_file(f"  → positive batch: {len(prompts_to_enhance)} prompt(s) in {num_buckets} bucket(s) of {slot_count}, cross-bucket variance enabled")
+            _log_to_file(f"  → positive batch: {len(prompts_to_enhance)} prompt(s) in {num_buckets} bucket(s) of {bucket}, cross-bucket variance enabled")
             pos_results = _batch_chat_completions(
                 base_url, model_name, system_prompt, prompts_to_enhance,
-                max_concurrent=slot_count,
+                max_concurrent=bucket,
                 request_timeout=request_timeout,
                 vary_across_buckets=True,
             )
@@ -866,11 +905,11 @@ class LlamaServerEnhance(scripts.Script):
 
                 print(
                     f"  Sending {len(neg_prompts)} negative prompt(s) "
-                    f"({slot_count} concurrent) ..."
+                    f"({bucket} concurrent) ..."
                 )
                 neg_results = _batch_chat_completions(
                     base_url, model_name, negative_system_prompt, neg_prompts,
-                    max_concurrent=slot_count,
+                    max_concurrent=bucket,
                     request_timeout=request_timeout,
                 )
                 neg_result_map: dict[int, ChatResult] = {idx: result for idx, result in neg_results}
