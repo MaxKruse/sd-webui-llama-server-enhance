@@ -4,8 +4,10 @@ Spawns a temporary llama-server instance, sends prompts via the OpenAI-compatibl
 /v1/chat/completions endpoint, extracts the `content` field (reasoning_content is
 stripped server-side), then kills the server.
 
-Supports both single-prompt and batch-prompt modes. In batch mode all requests are
-fired concurrently so the server can process them in parallel.
+Supports both single-prompt and batch-prompt modes. In batch mode requests run
+in strict buckets of ``max_concurrent``: a whole bucket must finish before the
+next one starts, so the server's parallel slots stay busy without unbounded
+overlap.
 """
 
 from __future__ import annotations
@@ -50,7 +52,7 @@ def _find_free_port() -> int:
     There's a tiny race window between releasing the socket and
     llama-server binding, but it's negligible in practice.
     """
-    candidates = random.sample(list(_PORT_RANGE), min(100, len(_PORT_RANGE)))
+    candidates = random.sample(_PORT_RANGE, 100)
     for port in candidates:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -234,6 +236,78 @@ def spawn_server(
 
     sp = _ServerProcess(proc, port, on_stderr=on_stderr)
     sp.start_drainers()
+    return sp
+
+
+def spawn_healthy_server(
+    server_path: str,
+    model_path: str,
+    extra_flags: str,
+    *,
+    startup_timeout: float | None = None,
+    on_stderr=None,
+    on_debug=None,
+    label: str = "",
+) -> _ServerProcess | None:
+    """Start a llama-server and wait until it is healthy.
+
+    Single spawn-wait-kill path shared by the WebUI integration,
+    ``enhance_prompt`` and the test scripts.
+
+    Progress is printed to stdout. ``on_stderr`` (optional callable)
+    receives decoded stderr chunks as they arrive; ``on_debug`` (optional
+    callable) receives the same diagnostic lines for a debug log sink, and
+    when absent the failure stderr tail goes to ``logger`` instead.
+    ``label`` is appended to the "Running llama-server" line (e.g. " (test)").
+
+    Returns the server handle, or None on failure (the server is already
+    killed in that case).
+    """
+    timeout = float(_SERVER_STARTUP_TIMEOUT if startup_timeout is None else startup_timeout)
+    port = _find_free_port()
+    model_name = Path(model_path).name
+
+    def _emit(line: str):
+        if on_debug is not None:
+            on_debug(line)
+
+    print(f"\n  Running llama-server (model: {model_name}, port: {port}){label}...")
+    _emit(f"  Running llama-server (model: {model_name}, port: {port}){label}...")
+
+    try:
+        sp = spawn_server(server_path, model_path, port, extra_flags, on_stderr=on_stderr)
+    except FileNotFoundError:
+        logger.error("llama-server not found at: %s", server_path)
+        print(f"  FAILED: llama-server not found at: {server_path}")
+        _emit(f"  → llama-server not found at {server_path}")
+        return None
+    except Exception:
+        logger.exception("Failed to start llama-server")
+        print("  FAILED: could not start llama-server")
+        _emit("  → failed to start llama-server")
+        return None
+
+    print(f"  Waiting for server to start (timeout: {timeout:.0f}s)...")
+    _emit(f"  Waiting for server to start (timeout: {timeout:.0f}s)...")
+    start = time.monotonic()
+
+    if not _wait_for_server(sp.base_url, timeout=timeout, proc=sp.proc):
+        elapsed = time.monotonic() - start
+        print(f"  FAILED: Server did not become healthy within {timeout:.0f}s ({elapsed:.1f}s elapsed)")
+        logger.error("Server did not become healthy within %.0fs", timeout)
+        _emit(f"  → server health check failed after {elapsed:.1f}s")
+        stderr_tail = sp.stderr_tail(3000)
+        if stderr_tail.strip():
+            _emit(f"  llama-server stderr (last 3000 chars):\n{stderr_tail}")
+            print(f"  Server stderr (last 500 chars):\n{stderr_tail[-500:]}")
+            if on_debug is None:
+                logger.warning("llama-server stderr (last 2000 chars):\n%s", stderr_tail[-2000:])
+        _kill_server(sp)
+        return None
+
+    elapsed = time.monotonic() - start
+    print(f"  Server ready on port {port} in {elapsed:.1f}s")
+    _emit(f"  Server ready on port {port} in {elapsed:.1f}s")
     return sp
 
 
@@ -749,58 +823,33 @@ def enhance_prompt(
     extra_flags: str = "",
     *,
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+    startup_timeout: float | None = None,
 ) -> ChatResult:
     """Enhance a prompt by spawning a temporary llama-server instance.
 
-    1. Find a free port by probing the ephemeral range.
-    2. Start llama-server on that port (output pipes drained continuously).
-    3. Wait for /health to confirm the server is ready.
-    4. Send the prompt via /v1/chat/completions.
-    5. Kill the server.
-    6. Return a ChatResult with content and timing stats.
+    1. Start llama-server on a free port (output pipes drained continuously).
+    2. Wait for /health to confirm the server is ready.
+    3. Send the prompt via /v1/chat/completions.
+    4. Kill the server (always, even on failure).
+    5. Return a ChatResult with content and timing stats.
     """
     if not Path(model_path).is_file():
         logger.error("Model file not found: %s", model_path)
         return ChatResult()
 
-    port = _find_free_port()
     logger.info("llama-server user prompt: %s", user_prompt)
-    print(f"\n  Running llama-server (model: {Path(model_path).name}, port: {port})...")
+    sp = spawn_healthy_server(
+        server_path, model_path, extra_flags, startup_timeout=startup_timeout,
+    )
+    if sp is None:
+        return ChatResult()
 
     try:
-        sp = spawn_server(server_path, model_path, port, extra_flags)
-    except FileNotFoundError:
-        logger.error("llama-server not found at: %s", server_path)
-        print(f"  FAILED: llama-server not found at: {server_path}")
-        return ChatResult()
-    except Exception:
-        logger.exception("Failed to start llama-server")
-        return ChatResult()
-
-    # Wait for /health to confirm the server is fully ready
-    print(f"  Waiting for server to start (timeout: {_SERVER_STARTUP_TIMEOUT}s)...")
-    start = time.monotonic()
-
-    if not _wait_for_server(sp.base_url, timeout=_SERVER_STARTUP_TIMEOUT, proc=sp.proc):
-        elapsed = time.monotonic() - start
-        print(f"  FAILED: Server did not become healthy within {_SERVER_STARTUP_TIMEOUT}s ({elapsed:.1f}s elapsed)")
-        logger.error("Server did not become healthy within %ds", _SERVER_STARTUP_TIMEOUT)
-        stderr_tail = sp.stderr_tail(2000)
-        if stderr_tail.strip():
-            logger.error("Server stderr (last 2000 chars):\n%s", stderr_tail)
+        return chat_completion_request(
+            sp, system_prompt, user_prompt, request_timeout=request_timeout,
+        )
+    finally:
         _kill_server(sp)
-        return ChatResult()
-
-    ready_time = time.monotonic()
-    print(f"  Server ready on port {port} in {ready_time - start:.1f}s.")
-
-    result = chat_completion_request(
-        sp, system_prompt, user_prompt, request_timeout=request_timeout,
-    )
-
-    # Always kill the server
-    _kill_server(sp)
-    return result
 
 
 def _kill_server(sp: _ServerProcess | None):

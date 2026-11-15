@@ -27,13 +27,11 @@ from prompt_enhancer.llm import (
     _ServerProcess,
     _discover_model_name,
     _discover_slot_count,
-    _find_free_port,
-    _wait_for_server,
     _warmup_chat_endpoint,
     _batch_chat_completions,
     _kill_server,
     chat_completion_request,
-    spawn_server,
+    spawn_healthy_server,
     enhance_prompt,
 )
 from prompt_enhancer.presets import AUTO_PRESET, load_preset, resolve_preset
@@ -111,49 +109,26 @@ def _spawn_healthy_server(
 ) -> _ServerProcess | None:
     """Start llama-server and wait until it becomes healthy.
 
-    Streams the server's stderr into the debug log while it runs.
-    Returns the server handle, or None on failure (already logged and killed).
+    Thin wrapper over the host-independent ``spawn_healthy_server`` that wires
+    in the WebUI-specific bits: the user-configured startup timeout and the
+    debug-log sinks (server stderr streamed in as ``[llama-server]`` lines,
+    plus the same diagnostic lines the helper prints).
     """
-    port = _find_free_port()
-    print(f"\n  Running llama-server (model: {Path(model_path).name}, port: {port}){label}...")
 
     def _on_stderr(chunk: str):
         for line in chunk.rstrip("\n").split("\n"):
             if line.strip():
                 _log_to_file(f"  [llama-server] {line}")
 
-    try:
-        sp = spawn_server(server_path, model_path, port, extra_flags, on_stderr=_on_stderr)
-    except FileNotFoundError:
-        logger.error("llama-server not found at: %s", server_path)
-        print(f"  FAILED: llama-server not found at: {server_path}")
-        _log_to_file(f"  → llama-server not found at {server_path}")
-        return None
-    except Exception:
-        logger.exception("Failed to start llama-server")
-        _log_to_file("  → failed to start llama-server")
-        return None
-
-    startup_timeout = _read_startup_timeout()
-    print(f"  Waiting for server to start (timeout: {startup_timeout:.0f}s)...")
-    start = time.monotonic()
-
-    if not _wait_for_server(sp.base_url, timeout=startup_timeout, proc=sp.proc):
-        elapsed = time.monotonic() - start
-        print(f"  FAILED: Server did not become healthy within {startup_timeout:.0f}s ({elapsed:.1f}s elapsed)")
-        logger.error("Server did not become healthy within %.0fs", startup_timeout)
-        _log_to_file(f"  → server health check failed after {elapsed:.1f}s")
-        stderr_tail = sp.stderr_tail(3000)
-        if stderr_tail.strip():
-            _log_to_file(f"  llama-server stderr (last 3000 chars):\n{stderr_tail}")
-            print(f"  Server stderr (last 500 chars):\n{stderr_tail[-500:]}")
-        _kill_server(sp)
-        return None
-
-    elapsed = time.monotonic() - start
-    print(f"  Server ready on port {port} in {elapsed:.1f}s")
-    _log_to_file(f"  Server ready on port {port} in {elapsed:.1f}s")
-    return sp
+    return spawn_healthy_server(
+        server_path,
+        model_path,
+        extra_flags,
+        startup_timeout=_read_startup_timeout(),
+        on_stderr=_on_stderr,
+        on_debug=_log_to_file,
+        label=label,
+    )
 
 
 def _free_gpu_memory():

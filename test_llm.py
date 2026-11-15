@@ -22,6 +22,9 @@ Examples:
     # Custom flags
     python test_llm.py --preset anima --model C:/models/my-model.gguf --flags "-ngl 99 --temp 0.5"
 
+    # Longer server startup timeout (large models / slow disk, default 60s)
+    python test_llm.py --preset anima --model C:/models/my-model.gguf --startup-timeout 120
+
     # Dry run (show command only, don't execute)
     python test_llm.py --preset anima --model C:/models/my-model.gguf --dry-run
 """
@@ -40,17 +43,15 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR))
 
 from prompt_enhancer.llm import (
-    _SERVER_STARTUP_TIMEOUT,
+    _PORT_RANGE,
     _build_command,
-    _find_free_port,
     _kill_server,
-    _wait_for_server,
     _batch_chat_completions,
     _discover_model_name,
     _discover_slot_count,
     _warmup_chat_endpoint,
     enhance_prompt,
-    spawn_server,
+    spawn_healthy_server,
 )
 from prompt_enhancer.presets import list_presets, load_preset, PRESETS_DIR
 
@@ -87,7 +88,7 @@ def test_preset_loading():
 def test_command_build(server_path: str, model_path: str, extra_flags: str):
     _print_header("Command Construction")
 
-    port = random.randint(49152, 65535)  # dummy port for dry-run display
+    port = random.choice(_PORT_RANGE)  # dummy port for dry-run display
     cmd = _build_command(server_path, model_path, port, extra_flags)
 
     print(f"\n  Binary:        {cmd[0]}")
@@ -136,11 +137,18 @@ def test_model_exists(model_path: str):
     return False
 
 
-def test_single(server_path: str, model_path: str, system_prompt: str, user_prompt: str, extra_flags: str, request_timeout: float = 120):
+def test_single(
+    server_path: str,
+    model_path: str,
+    system_prompt: str,
+    user_prompt: str,
+    extra_flags: str,
+    request_timeout: float = 120,
+    startup_timeout: float | None = None,
+):
     """Single-prompt mode: start server, send one prompt, kill server."""
     _print_header("Live Inference Test (Single Prompt)")
 
-    print(f"  Running llama-server...")
     start = time.monotonic()
 
     result = enhance_prompt(
@@ -150,6 +158,7 @@ def test_single(server_path: str, model_path: str, system_prompt: str, user_prom
         user_prompt=user_prompt,
         extra_flags=extra_flags,
         request_timeout=request_timeout,
+        startup_timeout=startup_timeout,
     )
 
     elapsed = time.monotonic() - start
@@ -163,36 +172,12 @@ def test_single(server_path: str, model_path: str, system_prompt: str, user_prom
     return result
 
 
-def _start_server(server_path: str, model_path: str, extra_flags: str):
+def _start_server(server_path: str, model_path: str, extra_flags: str, startup_timeout: float | None = None):
     """Start a llama-server (with drained output pipes) and return
     (base_url, sp) or (None, None) on failure."""
-    port = _find_free_port()
-
-    print(f"\n  Running llama-server (model: {Path(model_path).name}, port: {port})...")
-
-    try:
-        sp = spawn_server(server_path, model_path, port, extra_flags)
-    except FileNotFoundError:
-        print(f"  FAILED: llama-server not found at: {server_path}")
+    sp = spawn_healthy_server(server_path, model_path, extra_flags, startup_timeout=startup_timeout)
+    if sp is None:
         return None, None
-    except Exception:
-        print("  FAILED: could not start llama-server")
-        return None, None
-
-    print(f"  Waiting for server to start (timeout: {_SERVER_STARTUP_TIMEOUT}s)...")
-    start = time.monotonic()
-
-    if not _wait_for_server(sp.base_url, proc=sp.proc):
-        elapsed = time.monotonic() - start
-        print(f"  FAILED: Server did not become healthy within {_SERVER_STARTUP_TIMEOUT}s ({elapsed:.1f}s elapsed)")
-        stderr_tail = sp.stderr_tail(3000)
-        if stderr_tail.strip():
-            print(f"  Server stderr (last 500 chars):\n{stderr_tail[-500:]}")
-        _kill_server(sp)
-        return None, None
-
-    ready_time = time.monotonic()
-    print(f"  Server ready on port {port} in {ready_time - start:.1f}s")
     return sp.base_url, sp
 
 
@@ -204,6 +189,7 @@ def test_batch(
     extra_flags: str,
     request_timeout: float = 120,
     concurrency: int = 0,
+    startup_timeout: float | None = None,
 ):
     """Batch mode: start ONE server, send prompts in buckets, collect all, kill.
 
@@ -214,7 +200,7 @@ def test_batch(
     _print_header(f"Live Inference Test (Batch — {len(user_prompts)} prompt(s))")
 
     # Start a single server
-    base_url, server_proc = _start_server(server_path, model_path, extra_flags)
+    base_url, server_proc = _start_server(server_path, model_path, extra_flags, startup_timeout)
     if not base_url:
         return None
 
@@ -309,6 +295,12 @@ def main():
         help="Seconds to wait for a single LLM request before retrying (default: 120)",
     )
     parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=60.0,
+        help="Seconds to wait for the server to load the model (default: 60)",
+    )
+    parser.add_argument(
         "--concurrency",
         type=int,
         default=0,
@@ -391,6 +383,7 @@ def main():
             extra_flags=args.flags,
             request_timeout=args.timeout,
             concurrency=args.concurrency,
+            startup_timeout=args.startup_timeout,
         )
     else:
         test_single(
@@ -400,6 +393,7 @@ def main():
             user_prompt=user_prompts[0],
             extra_flags=args.flags,
             request_timeout=args.timeout,
+            startup_timeout=args.startup_timeout,
         )
 
     _print_header("All tests complete")
