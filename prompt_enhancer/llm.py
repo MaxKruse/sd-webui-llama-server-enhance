@@ -483,6 +483,31 @@ def _is_transient_error(exc: BaseException) -> bool:
     return isinstance(exc, (error.URLError, aiohttp.ClientError, json.JSONDecodeError, ConnectionError, TimeoutError, OSError))
 
 
+def _retry_backoff(attempt: int) -> float:
+    """Backoff (seconds) after a failed 1-based attempt: 3, 6, 12, 24 (capped 30).
+
+    A single request can take 16-30 s, so wide spacing is needed so later
+    attempts land after the first batch frees its slots.
+    """
+    return min(3 * (2 ** (attempt - 1)), 30)
+
+
+def _describe_error(exc: BaseException) -> str:
+    """One-line description of a chat-completion failure.
+
+    Shared by the sync (urllib) and async (aiohttp) retry loops. For
+    HTTP errors the response body is included (truncated) because it
+    usually carries the real reason (context overflow, bad request, ...).
+    """
+    if isinstance(exc, error.HTTPError):
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = "<unreadable>"
+        return f"HTTP {exc.code}: {body[:500]}"
+    return f"{type(exc).__name__}: {exc}"
+
+
 def _chat_completion(
     base_url: str,
     model_name: str,
@@ -546,14 +571,7 @@ def _chat_completion(
                     predicted_ms=predicted_ms,
                 )
         except Exception as exc:
-            if isinstance(exc, error.HTTPError):
-                try:
-                    body = exc.read().decode("utf-8", errors="replace")
-                except Exception:
-                    body = "<unreadable>"
-                last_error = f"HTTP {exc.code}: {body[:500]}"
-            else:
-                last_error = f"{type(exc).__name__}: {exc}"
+            last_error = _describe_error(exc)
             logger.error("Chat completion request failed (attempt %d/%d): %s", attempt, _MAX_CHAT_RETRIES, last_error)
             print(f"  Chat completion request failed (attempt {attempt}/{_MAX_CHAT_RETRIES}): {last_error}")
 
@@ -562,10 +580,8 @@ def _chat_completion(
                 break
 
         # Retry with exponential backoff (skip sleep on last attempt).
-        # Requests can take 16-30 s, so we need wide spacing so later
-        # attempts land after the first batch frees its slots.
         if attempt < _MAX_CHAT_RETRIES:
-            backoff = min(3 * (2 ** (attempt - 1)), 30)  # 3s, 6s, 12s, 24s (capped 30s)
+            backoff = _retry_backoff(attempt)
             logger.info("Retrying in %.1fs...", backoff)
             print(f"  Retrying in {backoff:.0f}s...")
             time.sleep(backoff)
@@ -605,6 +621,8 @@ async def _chat_completion_async(
     chat_result = ChatResult()
 
     for attempt in range(1, _MAX_CHAT_RETRIES + 1):
+        http_error_body = ""
+        failed_exc: BaseException | None = None
         try:
             async with session.post(
                 f"{base_url}/v1/chat/completions",
@@ -612,7 +630,16 @@ async def _chat_completion_async(
                 headers={"Authorization": "Bearer no-key"},
                 timeout=aiohttp.ClientTimeout(total=request_timeout),
             ) as resp:
-                resp.raise_for_status()
+                try:
+                    resp.raise_for_status()
+                except aiohttp.ClientResponseError:
+                    # Response is still open: read the body for diagnostics.
+                    # (ClientResponseError does not expose it.)
+                    try:
+                        http_error_body = (await resp.read()).decode("utf-8", errors="replace")[:500]
+                    except Exception:
+                        http_error_body = "<unreadable>"
+                    raise
                 result = await resp.json(content_type=None)
                 content = result["choices"][0]["message"]["content"]
 
@@ -632,25 +659,27 @@ async def _chat_completion_async(
                     predicted_ms=predicted_ms,
                 )
                 break  # Success
-
+        except aiohttp.ClientResponseError as exc:
+            failed_exc = exc
+            last_error = f"HTTP {exc.status}: {http_error_body}"
         except Exception as exc:
-            if isinstance(exc, aiohttp.ClientResponseError):
-                last_error = f"HTTP {exc.status}: {exc.message}"
-            else:
-                last_error = f"{type(exc).__name__}: {exc}"
-            logger.error("Chat completion request failed (attempt %d/%d): %s", attempt, _MAX_CHAT_RETRIES, last_error)
-            with _print_lock:
-                print(f"  Chat completion request failed (attempt {attempt}/{_MAX_CHAT_RETRIES}): {last_error}")
+            failed_exc = exc
+            last_error = _describe_error(exc)
+        else:
+            continue  # unreachable: the success path breaks above
 
-            if not _is_transient_error(exc):
-                logger.error("Error is not transient - not retrying")
-                break
+        # A request failed on this attempt - log, decide on retry.
+        logger.error("Chat completion request failed (attempt %d/%d): %s", attempt, _MAX_CHAT_RETRIES, last_error)
+        with _print_lock:
+            print(f"  Chat completion request failed (attempt {attempt}/{_MAX_CHAT_RETRIES}): {last_error}")
+
+        if not _is_transient_error(failed_exc):
+            logger.error("Error is not transient - not retrying")
+            break
 
         # Retry with exponential backoff (skip sleep on last attempt).
-        # Requests can take 16-30 s, so we need wide spacing so later
-        # attempts land after the first batch frees its slots.
         if attempt < _MAX_CHAT_RETRIES:
-            backoff = min(3 * (2 ** (attempt - 1)), 30)  # 3s, 6s, 12s, 24s (capped 30s)
+            backoff = _retry_backoff(attempt)
             logger.info("Retrying in %.1fs...", backoff)
             with _print_lock:
                 print(f"  Retrying in {backoff:.0f}s...")
