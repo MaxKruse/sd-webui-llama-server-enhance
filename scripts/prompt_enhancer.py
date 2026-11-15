@@ -34,7 +34,12 @@ from prompt_enhancer.llm import (
     chat_completion_request,
     spawn_healthy_server,
 )
-from prompt_enhancer.presets import load_preset, negatives_ignored, resolve_auto_preset
+from prompt_enhancer.presets import (
+    FORGE_TO_PRESET_MAP,
+    load_preset,
+    negatives_ignored,
+    resolve_auto_preset,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -656,11 +661,18 @@ class LlamaServerEnhance(scripts.Script):
         _log_to_file(f"  forge_preset={forge_preset!r}, checkpoint={checkpoint_name!r} → resolved={resolved!r}")
 
         if not resolved:
-            _log_to_file("  → no preset resolved, skipping")
+            mapped = ", ".join(sorted(set(FORGE_TO_PRESET_MAP.values())))
+            print(f"  Llama Enhance: skipping - Forge UI preset '{forge_preset}' has no LLM preset (mapped: {mapped})")
+            logger.warning(
+                "LLama Enhance: skipping - Forge UI preset %r has no LLM preset (mapped: %s)",
+                forge_preset, mapped,
+            )
+            _log_to_file(f"  → no preset resolved for forge_preset={forge_preset!r}, skipping")
             return
 
         preset_content = load_preset(resolved)
         if not preset_content:
+            print(f"  Llama Enhance: skipping - preset '{resolved}' not found (look in the presets/ directory)")
             logger.warning("Preset '%s' not found, skipping enhancement", resolved)
             _log_to_file(f"  → preset '{resolved}' not found, skipping")
             return
@@ -706,6 +718,7 @@ class LlamaServerEnhance(scripts.Script):
         server_path = shared.opts.llama_enhance_server_path or "llama-server"
         model_path = shared.opts.llama_enhance_model_path
         if not model_path:
+            print("  Llama Enhance: skipping - no model path set (Settings > LLama Server Enhance > Model path)")
             logger.warning("Model path not set, skipping enhancement")
             _log_to_file("  → model path not set, skipping")
             return
