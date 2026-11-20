@@ -1,0 +1,5 @@
+# Python dependencies for sd-webui-llama-server-enhance.
+# Installed automatically at startup by install.py (the Forge extension
+# installer). Manual install: python -m pip install -r requirements.txt
+# The <4 upper bound keeps the aiohttp 3.x client API the batch pipeline uses.
+aiohttp>=3.9,<4
