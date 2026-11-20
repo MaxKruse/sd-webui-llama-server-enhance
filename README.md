@@ -26,6 +26,8 @@ Drop this extension into your `extensions/` folder and get per-image prompt enha
    extensions/sd-webui-llama-server-enhance/
    ```
 
+   The extension's one Python dependency (`aiohttp`) is **installed automatically** at startup by the host (via the extension's `install.py`) - no manual pip step. If you launch Forge with `--skip-install` or the auto-install fails, install it manually in the host venv: `python -m pip install -r requirements.txt`.
+
 2. Ensure `llama-server` is available in your `PATH` or set the full path in WebUI settings.
 
 3. Set your model path in **Settings -> LLama Server Enhance**.
@@ -181,3 +183,4 @@ A debug log is written to `enhance_debug.log` in the extension root directory. I
 - **Stable Diffusion WebUI Forge** (or compatible Auto1111 fork)
 - **llama.cpp** - specifically the `llama-server` binary
 - A GGUF model file
+- **aiohttp** (Python) - used by the batch pipeline. Installed automatically at startup by `install.py` (`aiohttp>=3.9,<4`)
