@@ -19,15 +19,15 @@ import logging
 import aiohttp
 
 from prompt_enhancer.client import (
+    _MAX_CHAT_RETRIES,
     DEFAULT_REQUEST_TIMEOUT,
     ChatResult,
-    _MAX_CHAT_RETRIES,
+    _clean_http_error,
     _completion_payload,
     _describe_error,
     _is_transient_error,
     _print_lock,
     _retry_backoff,
-    _clean_http_error,
 )
 
 logger = logging.getLogger(__name__)

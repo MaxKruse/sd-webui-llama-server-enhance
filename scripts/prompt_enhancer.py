@@ -13,13 +13,8 @@ import time
 from pathlib import Path
 
 import gradio as gr
-import modules.scripts as scripts
-from modules import script_callbacks, shared
-from modules.ui_components import InputAccordion
-from modules.processing import StableDiffusionProcessing
-
-from prompt_enhancer import settings as _settings_module
 from prompt_enhancer import opts as _opts
+from prompt_enhancer import settings as _settings_module
 from prompt_enhancer.client import chat_completion_request
 from prompt_enhancer.flow import (
     BUCKET_SIZE_AUTO,
@@ -30,14 +25,19 @@ from prompt_enhancer.flow import (
 )
 from prompt_enhancer.logfile import RotatingLog
 from prompt_enhancer.negative import build_negative_instruction
-from prompt_enhancer.prompts import get_effective_dimensions
-from prompt_enhancer.server import _ServerProcess, _discover_model_name, _kill_server
 from prompt_enhancer.presets import (
     FORGE_TO_PRESET_MAP,
     load_preset,
     negatives_ignored,
     resolve_auto_preset,
 )
+from prompt_enhancer.prompts import get_effective_dimensions
+from prompt_enhancer.server import _discover_model_name, _kill_server, _ServerProcess
+
+import modules.scripts as scripts
+from modules import script_callbacks, shared
+from modules.processing import StableDiffusionProcessing
+from modules.ui_components import InputAccordion
 
 logger = logging.getLogger(__name__)
 

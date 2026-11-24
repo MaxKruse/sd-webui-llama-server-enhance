@@ -20,9 +20,9 @@ from urllib import error, request
 import aiohttp
 
 from prompt_enhancer.server import (
-    _ServerProcess,
     _discover_model_name,
     _kill_server,
+    _ServerProcess,
     _warmup_chat_endpoint,
     spawn_healthy_server,
 )
