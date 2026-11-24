@@ -6,7 +6,7 @@ Drop this extension into your `extensions/` folder and get per-image prompt enha
 
 ## Features
 
-- **Batch mode** - starts a single `llama-server` instance and sends all prompts in parallel, eliminating per-image startup penalties
+- **Batch mode** - starts a single `llama-server` instance and sends all prompts in strict buckets of the server's parallel slot count, eliminating per-image startup penalties
 - **Auto preset selection** - automatically selects the correct system prompt preset based on the Forge-Neo UI preset (flux, zit, anima)
 - **Hires fix aware** - provides the LLM with final output dimensions (after hires fix upscaling) so it can frame compositions appropriately
 - **Dynamic Prompts integration** - automatically escapes accidental DP syntax in LLM output; supports custom DP separators (configurable `variant_start`, `variant_end`, `wildcard_wrap`). See [Dynamic Prompts Integration](#dynamic-prompts-integration) for execution order
