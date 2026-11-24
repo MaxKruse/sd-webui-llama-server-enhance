@@ -55,6 +55,7 @@ check("POSITIVE: " in instruction, "instruction mentions the POSITIVE marker")
 check("NEVER" in instruction.upper(), "instruction forbids repeating the positive")
 check("Output:" in instruction, "instruction includes a concrete example")
 check("comma-separated" in instruction.lower(), "instruction requires a comma-separated line")
+check("no line breaks" in instruction.lower(), "instruction forbids line breaks in the output")
 
 # --- build_negative_user_prompt -------------------------------------------------
 
@@ -97,10 +98,18 @@ check(cleaned is None, "marker mid-output is rejected")
 cleaned, reason = validate_negative_output(POSITIVE, ORIGINAL_NEGATIVE, GOOD + "\nextra line")
 check(cleaned is None and "multi-line" in reason, "multi-line output is rejected")
 
-# Overlong output is rejected.
-long_negative = "blurry, " * 80
+# No length cap: a long scene-tailored single-line negative is accepted
+# (the echo check covers the real risk; scene-tailored negatives are
+# naturally 300-600 chars).
+long_negative = (
+    "worst quality, low quality, score_1-3, artist name, watermark, signature, text, blurry, "
+    "jpeg artifacts, chromatic aberration, bad anatomy, deformed hands, extra fingers, "
+    "missing fingers, extra limbs, deformed face, asymmetric eyes, bad teeth, cropped, "
+    "out of frame, bad proportions, long neck, error, fingerprint, lowres, bad feet, "
+    "extra digits, bad joints, gross proportions"
+)
 cleaned, reason = validate_negative_output(POSITIVE, ORIGINAL_NEGATIVE, long_negative)
-check(cleaned is None and "too long" in reason, "overlong output is rejected")
+check(reason is None and cleaned == long_negative, "long scene-tailored single-line negative is accepted")
 
 # Output identical to the original negative is rejected.
 cleaned, reason = validate_negative_output(POSITIVE, ORIGINAL_NEGATIVE, ORIGINAL_NEGATIVE)
