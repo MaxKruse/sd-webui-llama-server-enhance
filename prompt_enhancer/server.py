@@ -33,6 +33,11 @@ _SERVER_STARTUP_TIMEOUT = 60
 # Port range to probe for a free port.
 _PORT_RANGE = range(49152, 65536)
 
+# The tiny user message used to warm up the chat endpoint. A constant so the
+# offline tests (test_flow.py) register it with their fake server instead of
+# hardcoding a second copy that would break silently on a change.
+_WARMUP_PROMPT = "hi"
+
 
 def _find_free_port() -> int:
     """Find a free TCP port by probing random ports in the ephemeral range.
@@ -448,7 +453,7 @@ def _warmup_chat_endpoint(base_url: str, model_name: str, num_slots: int = 2):
     """
     payload = {
         "model": model_name,
-        "messages": [{"role": "user", "content": "hi"}],
+        "messages": [{"role": "user", "content": _WARMUP_PROMPT}],
         "max_tokens": 1,
     }
     data = json.dumps(payload).encode("utf-8")
