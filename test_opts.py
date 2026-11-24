@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
+
+_EXT_ROOT = Path(__file__).resolve().parent
 
 # Stub the host boundary BEFORE importing the module under test.
 _MODULES_STUB = types.ModuleType("modules")
@@ -117,11 +120,38 @@ def test_path_and_flag_accessors():
     check("missing extra flags -> ''", o.read_extra_flags() == "", repr(o.read_extra_flags()))
 
 
+# ---------------------------------------------------------------------------
+# spawn_healthy_server wrapper (delegates to the server.py helper)
+# ---------------------------------------------------------------------------
+
+def test_spawn_wrapper_delegates_to_server_helper():
+    print("\n=== spawn_healthy_server wrapper ===")
+    lines: list[str] = []
+    # A real binary that exits immediately (the venv's python with a .txt
+    # "model"): the wrapper must delegate to the server helper, which then
+    # observes the early exit and returns None - not raise.
+    _SHARED_STUB.opts = SimpleNamespace(
+        llama_enhance_server_path=sys.executable,
+        llama_enhance_model_path=str(_EXT_ROOT / "presets" / "anima.txt"),
+        llama_enhance_extra_flags="",
+        llama_enhance_startup_timeout=2,
+    )
+    try:
+        result = o.spawn_healthy_server(lines.append, label=" (test)")
+    except TypeError as exc:
+        check("wrapper delegates to the server helper (no TypeError)", False, repr(exc))
+        return
+    check("unspawnable server -> None (killed, no exception)", result is None, repr(result))
+    check("server helper ran with the debug sink wired",
+          any("Running llama-server" in line for line in lines), repr(lines[:3]))
+
+
 def main():
     print("opts tests (host `modules` stubbed, real module under test)")
     test_request_timeout()
     test_startup_timeout()
     test_path_and_flag_accessors()
+    test_spawn_wrapper_delegates_to_server_helper()
     print(f"\n=== Results: {passed} passed, {failed} failed ===")
     sys.exit(1 if failed else 0)
 

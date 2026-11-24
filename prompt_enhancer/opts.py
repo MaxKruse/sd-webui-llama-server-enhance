@@ -18,7 +18,14 @@ from modules import shared
 
 from prompt_enhancer.client import DEFAULT_REQUEST_TIMEOUT
 from prompt_enhancer.prompts import assemble_system_prompt, build_dp_wildcard_instruction
-from prompt_enhancer.server import _SERVER_STARTUP_TIMEOUT, spawn_healthy_server
+# Imported under an alias: the settings-backed wrapper below keeps the
+# public name `spawn_healthy_server`, and a same-name import would be
+# shadowed by that def - making the wrapper call itself (TypeError)
+# instead of the server.py helper.
+from prompt_enhancer.server import (
+    _SERVER_STARTUP_TIMEOUT,
+    spawn_healthy_server as _spawn_server_impl,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +147,7 @@ def spawn_healthy_server(on_debug, label: str = ""):
             if line.strip():
                 on_debug(f"  [llama-server] {line}")
 
-    return spawn_healthy_server(
+    return _spawn_server_impl(
         read_server_path(),
         read_model_path(),
         read_extra_flags(),
