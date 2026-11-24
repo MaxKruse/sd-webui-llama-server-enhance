@@ -1,10 +1,9 @@
 """System-prompt assembly for LLM enhancement.
 
 Host-independent (stdlib only): hires-fix dimension math, the resolution
-context block, the Dynamic Prompts wildcard-preservation note, and the
-base assembly shared by the positive and negative enhancement calls.
-The caller reads settings (hires fix state, DP separators, DP install
-check) and passes the values in.
+context block, and the base assembly shared by the positive and negative
+enhancement calls. The caller reads settings (hires fix state) and
+passes the values in.
 """
 
 from __future__ import annotations
@@ -70,26 +69,6 @@ def build_resolution_instruction(
     return block
 
 
-def build_dp_wildcard_instruction(wc_wrap: str, v_start: str, v_end: str) -> str:
-    """Build a wildcard-preservation instruction for the LLM system prompt.
-
-    Uses the user's Dynamic Prompts settings (wildcard wrapper and variant
-    brackets), passed in by the caller.
-    """
-    return (
-        "\n\n--- Dynamic Prompts Wildcards (MUST be preserved verbatim) ---\n"
-        "The user's prompt may contain Dynamic Prompts wildcards that will be "
-        "expanded AFTER your enhancement. You MUST keep every wildcard token "
-        "exactly as written — do NOT expand, replace, or remove them.\n\n"
-        f"  Wildcard syntax: {wc_wrap}<name>{wc_wrap}  "
-        "(e.g. __style__, __artist__)\n"
-        f"  Variant syntax:  {v_start}option1|option2{v_end}  "
-        f"(e.g. {v_start}red|blue|green{v_end})\n\n"
-        "Your job is to enhance the NON-wildcard parts of the prompt while "
-        f"leaving all {wc_wrap}...{wc_wrap} and {v_start}...{v_end} tokens untouched.\n"
-    )
-
-
 def assemble_system_prompt(
     preset_content: str,
     *,
@@ -98,7 +77,6 @@ def assemble_system_prompt(
     hires: bool = False,
     base_width: int = 0,
     base_height: int = 0,
-    dp_instruction: str = "",
     negative_instruction: str | None = None,
 ) -> tuple[str, str | None]:
     """Assemble the system prompts for the enhancement calls.
@@ -117,10 +95,6 @@ def assemble_system_prompt(
             base_width=base_width,
             base_height=base_height,
         )
-
-    # Append Dynamic Prompts wildcard preservation note
-    if dp_instruction:
-        result += dp_instruction
 
     if negative_instruction is None:
         return result, None

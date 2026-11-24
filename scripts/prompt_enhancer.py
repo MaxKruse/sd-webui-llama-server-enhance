@@ -41,9 +41,6 @@ from modules.ui_components import InputAccordion
 
 logger = logging.getLogger(__name__)
 
-# Resolve the extensions directory relative to this file
-_EXTENSIONS_DIR = Path(__file__).resolve().parent.parent.parent.parent
-
 # Debug log - written to the extension root so it's easy to find.
 # Rotates to enhance_debug.log.1 at 5MB (thread-safe: the WebUI main thread
 # and the server's stderr pipe drainer write concurrently).
@@ -88,10 +85,10 @@ class LlamaServerEnhance(scripts.Script):
 
     # NOTE: sorting_priority only orders this always-visible UI accordion
     # section - it does NOT control process() call order. Forge invokes
-    # process() in extension discovery order (alphabetical), so
-    # sd-dynamic-prompts normally expands wildcards BEFORE we enhance.
-    # To enhance raw prompts first, pin this script above "Script" in
-    # Settings -> "Script process callback priority".
+    # process() in extension discovery order (alphabetical), which already
+    # puts sd-dynamic-prompts before us; the callback-ordering instruction
+    # in metadata.ini makes that explicit, so DP always expands
+    # wildcards/variants BEFORE we enhance and we never see raw wildcards.
     sorting_priority = 999
 
     def title(self):
@@ -369,7 +366,7 @@ class LlamaServerEnhance(scripts.Script):
             f"hires={hires_enabled}, final={final_w}x{final_h}"
         )
 
-        # Build system prompts (preset + resolution + Dynamic Prompts wildcard note)
+        # Build system prompts (preset + resolution context)
         system_prompt, negative_system_prompt = _opts.build_system_prompts(
             preset_content,
             width=final_w,
@@ -377,7 +374,6 @@ class LlamaServerEnhance(scripts.Script):
             hires=hires_enabled,
             base_width=base_w,
             base_height=base_h,
-            extensions_dir=_EXTENSIONS_DIR,
             negative_instruction=build_negative_instruction() if enhance_negative else None,
         )
         _DEBUG_LOG.write(f"  system_prompt ({len(system_prompt)} chars): {system_prompt[:200]}...")
