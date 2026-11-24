@@ -214,8 +214,9 @@ class LlamaServerEnhance(scripts.Script):
     def _check_server_prereqs(self) -> tuple[bool, list[str]]:
         """Check the configured binary and model file. Returns (ok, lines):
         a non-empty lines list is the full user-facing result on failure."""
-        server_path = shared.opts.llama_enhance_server_path or "llama-server"
-        model_path = shared.opts.llama_enhance_model_path or ""
+        # Same defensive accessors the spawn path uses (opts.py).
+        server_path = _opts.read_server_path()
+        model_path = _opts.read_model_path()
 
         # 1. Binary check
         binary = str(Path(server_path).resolve()) if Path(server_path).is_file() else shutil.which(server_path)

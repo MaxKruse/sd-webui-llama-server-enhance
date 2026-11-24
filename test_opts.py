@@ -91,10 +91,37 @@ def test_startup_timeout():
           repr(o.read_startup_timeout()))
 
 
+# ---------------------------------------------------------------------------
+# read_server_path / read_model_path / read_extra_flags
+# ---------------------------------------------------------------------------
+
+def test_path_and_flag_accessors():
+    print("\n=== read_server_path / read_model_path / read_extra_flags ===")
+    set_opts(llama_enhance_server_path="C:/tools/llama-server.exe")
+    check("server path passes through", o.read_server_path() == "C:/tools/llama-server.exe",
+          repr(o.read_server_path()))
+    set_opts()
+    check("missing server path falls back to the PATH name", o.read_server_path() == "llama-server",
+          repr(o.read_server_path()))
+    set_opts(llama_enhance_model_path="C:/models/m.gguf")
+    check("model path passes through", o.read_model_path() == "C:/models/m.gguf",
+          repr(o.read_model_path()))
+    set_opts(llama_enhance_model_path="")
+    check("empty model path -> ''", o.read_model_path() == "", repr(o.read_model_path()))
+    set_opts()
+    check("missing model path -> ''", o.read_model_path() == "", repr(o.read_model_path()))
+    set_opts(llama_enhance_extra_flags="-ngl 99")
+    check("extra flags pass through", o.read_extra_flags() == "-ngl 99",
+          repr(o.read_extra_flags()))
+    set_opts()
+    check("missing extra flags -> ''", o.read_extra_flags() == "", repr(o.read_extra_flags()))
+
+
 def main():
     print("opts tests (host `modules` stubbed, real module under test)")
     test_request_timeout()
     test_startup_timeout()
+    test_path_and_flag_accessors()
     print(f"\n=== Results: {passed} passed, {failed} failed ===")
     sys.exit(1 if failed else 0)
 

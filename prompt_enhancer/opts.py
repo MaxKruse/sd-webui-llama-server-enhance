@@ -67,17 +67,17 @@ def read_startup_timeout() -> float:
 
 def read_server_path() -> str:
     """The llama-server binary path; defaults to 'llama-server' from PATH."""
-    return shared.opts.llama_enhance_server_path or "llama-server"
+    return getattr(shared.opts, "llama_enhance_server_path", "") or "llama-server"
 
 
 def read_model_path() -> str:
     """The configured .gguf model path ("" if unset)."""
-    return shared.opts.llama_enhance_model_path or ""
+    return getattr(shared.opts, "llama_enhance_model_path", "") or ""
 
 
 def read_extra_flags() -> str:
     """Extra llama-server flags from settings."""
-    return shared.opts.llama_enhance_extra_flags or ""
+    return getattr(shared.opts, "llama_enhance_extra_flags", "") or ""
 
 
 def read_dp_separators() -> tuple[str, str, str]:
