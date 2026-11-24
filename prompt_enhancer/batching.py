@@ -19,6 +19,7 @@ import logging
 import aiohttp
 
 from prompt_enhancer.client import (
+    DEFAULT_REQUEST_TIMEOUT,
     ChatResult,
     _MAX_CHAT_RETRIES,
     _completion_payload,
@@ -30,9 +31,6 @@ from prompt_enhancer.client import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Seconds to wait for a single chat completion request before giving up on it.
-DEFAULT_REQUEST_TIMEOUT = 120
 
 
 async def _send_chat_request_async(
