@@ -29,12 +29,16 @@ from pathlib import Path
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR))
 
-from prompt_enhancer.llm import (
+from prompt_enhancer.batching import (
     _batch_chat_completions,
-    _clean_http_error,
-    _describe_error,
     _plan_buckets,
     _variation_reference_block,
+)
+from prompt_enhancer.client import (
+    _clean_http_error,
+    _describe_error,
+)
+from prompt_enhancer.server import (
     _wait_for_server,
 )
 

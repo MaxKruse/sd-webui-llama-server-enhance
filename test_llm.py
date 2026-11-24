@@ -42,15 +42,19 @@ from pathlib import Path
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR))
 
-from prompt_enhancer.llm import (
+from prompt_enhancer.batching import (
+    _batch_chat_completions,
+)
+from prompt_enhancer.client import (
+    enhance_prompt,
+)
+from prompt_enhancer.server import (
     _PORT_RANGE,
     _build_command,
-    _kill_server,
-    _batch_chat_completions,
     _discover_model_name,
     _discover_slot_count,
+    _kill_server,
     _warmup_chat_endpoint,
-    enhance_prompt,
     spawn_healthy_server,
 )
 from prompt_enhancer.presets import (

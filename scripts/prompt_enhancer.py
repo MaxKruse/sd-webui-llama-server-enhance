@@ -21,17 +21,19 @@ from modules.ui_components import InputAccordion
 from modules.processing import StableDiffusionProcessing
 
 from prompt_enhancer import settings as _settings_module
-from prompt_enhancer.llm import (
+from prompt_enhancer.batching import _batch_chat_completions
+from prompt_enhancer.client import (
     ChatResult,
     DEFAULT_REQUEST_TIMEOUT,
+    chat_completion_request,
+)
+from prompt_enhancer.server import (
     _SERVER_STARTUP_TIMEOUT,
     _ServerProcess,
     _discover_model_name,
     _discover_slot_count,
-    _warmup_chat_endpoint,
-    _batch_chat_completions,
     _kill_server,
-    chat_completion_request,
+    _warmup_chat_endpoint,
     spawn_healthy_server,
 )
 from prompt_enhancer.presets import (

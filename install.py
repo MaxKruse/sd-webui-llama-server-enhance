@@ -3,7 +3,7 @@
 Forge runs this file at startup: modules/launch_utils.py
 run_extensions_installers() executes each extension's install.py with the
 host venv's python, before extension scripts are loaded - which is what
-makes the aiohttp dependency of prompt_enhancer/llm.py available before
+makes the aiohttp dependency of prompt_enhancer/client.py available before
 scripts/prompt_enhancer.py imports it.
 
 It is a no-op once requirements.txt is satisfied, and re-checks on every
