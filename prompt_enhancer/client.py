@@ -67,9 +67,6 @@ class ChatResult:
         """Total inference time in milliseconds."""
         return self.prompt_ms + self.predicted_ms
 
-    def __bool__(self):
-        return bool(self.content)
-
 
 def _completion_payload(model_name: str, system_prompt: str, user_prompt: str) -> dict:
     """Build the /v1/chat/completions request body (shared by sync and async)."""

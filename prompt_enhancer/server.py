@@ -442,7 +442,7 @@ def _warmup_slot(base_url: str, data: bytes, slot_num: int, deadline: float) -> 
     return False
 
 
-def _warmup_chat_endpoint(base_url: str, model_name: str, num_slots: int = 2):
+def _warmup_chat_endpoint(base_url: str, model_name: str, num_slots: int):
     """Send minimal chat completions to warm up the chat handler and parallel slots.
 
     With --no-warmup + --parallel N, /health returns 200 before the chat
