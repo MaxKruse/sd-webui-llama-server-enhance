@@ -12,14 +12,10 @@ host-independent so the logic can be tested standalone.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 from modules import shared
 from prompt_enhancer.client import DEFAULT_REQUEST_TIMEOUT
-from prompt_enhancer.prompts import (
-    assemble_system_prompt,
-    build_dp_wildcard_instruction,
-)
+from prompt_enhancer.prompts import assemble_system_prompt
 
 # spawn_healthy_server is imported under an alias: the settings-backed
 # wrapper below keeps the public name `spawn_healthy_server`, and a
@@ -100,11 +96,6 @@ def read_dp_separators() -> tuple[str, str, str]:
     return v_start, v_end, wc_wrap
 
 
-def dynamic_prompts_installed(extensions_dir: Path) -> bool:
-    """Check if the sd-dynamic-prompts extension is present."""
-    return (extensions_dir / "sd-dynamic-prompts").is_dir()
-
-
 def build_system_prompts(
     preset_content: str,
     *,
@@ -113,19 +104,14 @@ def build_system_prompts(
     hires: bool,
     base_width: int,
     base_height: int,
-    extensions_dir: Path,
     negative_instruction: str | None = None,
 ) -> tuple[str, str | None]:
     """Assemble the positive (and negative) system prompts for one generation.
 
-    Appends the resolution context to the preset, plus the DP
-    wildcard-preservation note when sd-dynamic-prompts is installed.
+    Appends the resolution context to the preset. No wildcard-preservation
+    note: this extension runs after sd-dynamic-prompts (see metadata.ini),
+    so the prompt it enhances never contains unexpanded wildcards.
     """
-    dp_instruction = ""
-    if dynamic_prompts_installed(extensions_dir):
-        wc_wrap, v_start, v_end = read_dp_separators()
-        dp_instruction = build_dp_wildcard_instruction(wc_wrap, v_start, v_end)
-
     return assemble_system_prompt(
         preset_content,
         width=width,
@@ -133,7 +119,6 @@ def build_system_prompts(
         hires=hires,
         base_width=base_width,
         base_height=base_height,
-        dp_instruction=dp_instruction,
         negative_instruction=negative_instruction,
     )
 

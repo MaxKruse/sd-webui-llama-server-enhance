@@ -6,6 +6,8 @@ This file is intended for human reading and was written with the assistance of a
 from __future__ import annotations
 
 from modules import shared
+from prompt_enhancer.client import DEFAULT_REQUEST_TIMEOUT
+from prompt_enhancer.server import _SERVER_STARTUP_TIMEOUT
 
 
 def on_ui_settings():
@@ -31,16 +33,16 @@ def on_ui_settings():
     shared.opts.add_option(
         key="llama_enhance_timeout",
         info=shared.OptionInfo(
-            120,
-            label="Request timeout: Seconds to wait for a single LLM request before retrying (default: 120)",
+            DEFAULT_REQUEST_TIMEOUT,
+            label=f"Request timeout: Seconds to wait for a single LLM request before retrying (default: {DEFAULT_REQUEST_TIMEOUT})",
             section=section,
         ),
     )
     shared.opts.add_option(
         key="llama_enhance_startup_timeout",
         info=shared.OptionInfo(
-            60,
-            label="Server startup timeout: Seconds to wait for llama-server to load the model and become healthy (default: 60)",
+            _SERVER_STARTUP_TIMEOUT,
+            label=f"Server startup timeout: Seconds to wait for llama-server to load the model and become healthy (default: {_SERVER_STARTUP_TIMEOUT})",
             section=section,
         ),
     )
