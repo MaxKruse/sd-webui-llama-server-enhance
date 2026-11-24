@@ -5,14 +5,12 @@ This file was modified with the assistance of an LLM.
 
 from __future__ import annotations
 
+import gc
 import logging
 import shutil
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
-
-import gc
 
 import gradio as gr
 import modules.scripts as scripts
@@ -21,21 +19,21 @@ from modules.ui_components import InputAccordion
 from modules.processing import StableDiffusionProcessing
 
 from prompt_enhancer import settings as _settings_module
+from prompt_enhancer import opts as _opts
 from prompt_enhancer.batching import _batch_chat_completions
 from prompt_enhancer.client import (
     ChatResult,
-    DEFAULT_REQUEST_TIMEOUT,
     chat_completion_request,
 )
 from prompt_enhancer.escape import escape_accidental_dp_syntax
+from prompt_enhancer.logfile import RotatingLog
+from prompt_enhancer.prompts import get_effective_dimensions
 from prompt_enhancer.server import (
-    _SERVER_STARTUP_TIMEOUT,
     _ServerProcess,
     _discover_model_name,
     _discover_slot_count,
     _kill_server,
     _warmup_chat_endpoint,
-    spawn_healthy_server,
 )
 from prompt_enhancer.presets import (
     FORGE_TO_PRESET_MAP,
@@ -49,70 +47,15 @@ logger = logging.getLogger(__name__)
 # Resolve the extensions directory relative to this file
 _EXTENSIONS_DIR = Path(__file__).resolve().parent.parent.parent.parent
 
-# Log file for debugging - written to the extension root so it's easy to find
+# Debug log - written to the extension root so it's easy to find.
+# Rotates to enhance_debug.log.1 at 5MB (thread-safe: the WebUI main thread
+# and the server's stderr pipe drainer write concurrently).
 _LOG_DIR = Path(__file__).resolve().parent.parent
 _LOG_FILE = _LOG_DIR / "enhance_debug.log"
-_LOG_BACKUP = _LOG_FILE.with_name("enhance_debug.log.1")
-
-# Rotate the debug log once it grows past this size (bytes).
-_LOG_MAX_BYTES = 5 * 1024 * 1024
-
-# Guards the log file against concurrent writers (main thread + pipe drainer).
-_LOG_LOCK = threading.Lock()
+_DEBUG_LOG = RotatingLog(_LOG_FILE)
 
 # Guards the UI "Test server" button against concurrent runs.
 _TEST_LOCK = threading.Lock()
-
-
-def _rotate_log_if_needed():
-    """Rotate the debug log to enhance_debug.log.1 once it passes the size limit."""
-    try:
-        if _LOG_FILE.exists() and _LOG_FILE.stat().st_size > _LOG_MAX_BYTES:
-            if _LOG_BACKUP.exists():
-                _LOG_BACKUP.unlink()
-            _LOG_FILE.rename(_LOG_BACKUP)
-    except OSError:
-        logger.warning("Could not rotate debug log", exc_info=True)
-
-
-def _log_to_file(msg: str):
-    """Append a timestamped message to the debug log file (thread-safe)."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    line = f"[{timestamp}] {msg}\n"
-    with _LOG_LOCK:
-        _rotate_log_if_needed()
-        with open(_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line)
-
-
-def _read_request_timeout() -> float:
-    """Read the per-request LLM timeout from settings (seconds)."""
-    try:
-        return float(
-            getattr(shared.opts, "llama_enhance_timeout", DEFAULT_REQUEST_TIMEOUT)
-            or DEFAULT_REQUEST_TIMEOUT
-        )
-    except (TypeError, ValueError):
-        logger.warning(
-            "Invalid llama_enhance_timeout value - falling back to %ss",
-            DEFAULT_REQUEST_TIMEOUT,
-        )
-        return float(DEFAULT_REQUEST_TIMEOUT)
-
-
-def _read_startup_timeout() -> float:
-    """Read the server startup timeout from settings (seconds)."""
-    try:
-        return float(
-            getattr(shared.opts, "llama_enhance_startup_timeout", _SERVER_STARTUP_TIMEOUT)
-            or _SERVER_STARTUP_TIMEOUT
-        )
-    except (TypeError, ValueError):
-        logger.warning(
-            "Invalid llama_enhance_startup_timeout value - falling back to %ss",
-            _SERVER_STARTUP_TIMEOUT,
-        )
-        return float(_SERVER_STARTUP_TIMEOUT)
 
 
 # Bucket-size dropdown choices for "Per image" mode. The Auto choice means
@@ -130,34 +73,9 @@ def _parse_bucket_size(raw) -> int:
     return max(1, value)
 
 
-def _spawn_healthy_server(
-    server_path: str,
-    model_path: str,
-    extra_flags: str,
-    label: str = "",
-) -> _ServerProcess | None:
-    """Start llama-server and wait until it becomes healthy.
-
-    Thin wrapper over the host-independent ``spawn_healthy_server`` that wires
-    in the WebUI-specific bits: the user-configured startup timeout and the
-    debug-log sinks (server stderr streamed in as ``[llama-server]`` lines,
-    plus the same diagnostic lines the helper prints).
-    """
-
-    def _on_stderr(chunk: str):
-        for line in chunk.rstrip("\n").split("\n"):
-            if line.strip():
-                _log_to_file(f"  [llama-server] {line}")
-
-    return spawn_healthy_server(
-        server_path,
-        model_path,
-        extra_flags,
-        startup_timeout=_read_startup_timeout(),
-        on_stderr=_on_stderr,
-        on_debug=_log_to_file,
-        label=label,
-    )
+def _spawn_healthy_server(label: str = ""):
+    """Start llama-server (settings + debug log wired in) and wait for health."""
+    return _opts.spawn_healthy_server(_DEBUG_LOG.write, label=label)
 
 
 def _free_gpu_memory():
@@ -172,66 +90,10 @@ def _free_gpu_memory():
         memory_management.unload_all_models()
         memory_management.soft_empty_cache(force=True)
         gc.collect()
-        _log_to_file("  GPU memory freed for llama-server")
+        _DEBUG_LOG.write("  GPU memory freed for llama-server")
     except Exception:
         logger.warning("Could not unload SD models from GPU (non-Forge install?)", exc_info=True)
-        _log_to_file("  WARNING: could not free GPU memory (backend module unavailable)")
-
-
-def _dynamic_prompts_installed() -> bool:
-    """Check if the sd-dynamic-prompts extension is present."""
-    return (_EXTENSIONS_DIR / "sd-dynamic-prompts").is_dir()
-
-
-def _get_effective_dimensions(p) -> tuple[int, int]:
-    """Get the final output dimensions, accounting for hires fix.
-
-    Returns (width, height) of the final rendered image.
-    Mirrors the logic in StableDiffusionProcessingTxt2Img.calculate_target_resolution().
-    """
-    if not getattr(p, "enable_hr", False):
-        return (p.width, p.height)
-
-    hr_resize_x = getattr(p, "hr_resize_x", 0)
-    hr_resize_y = getattr(p, "hr_resize_y", 0)
-
-    if hr_resize_x == 0 and hr_resize_y == 0:
-        hr_scale = getattr(p, "hr_scale", 2.0)
-        return (round(p.width * hr_scale), round(p.height * hr_scale))
-
-    if hr_resize_y == 0:
-        return (hr_resize_x, round(hr_resize_x * (p.height / p.width)))
-    elif hr_resize_x == 0:
-        return (round(hr_resize_y * (p.width / p.height)), hr_resize_y)
-
-    return (hr_resize_x, hr_resize_y)
-
-
-def _build_resolution_instruction(width: int, height: int, *, hires: bool = False, base_width: int = 0, base_height: int = 0) -> str:
-    """Build a resolution hint block for the LLM system prompt.
-
-    Tells the LLM the target image dimensions and orientation so it can
-    frame compositions, aspect ratios, and layout descriptions appropriately.
-    Includes hires fix info when applicable.
-    """
-    gcd = __import__("math").gcd(width, height)
-    ratio_w, ratio_h = width // gcd, height // gcd
-    orientation = "portrait" if height > width else "landscape" if width > height else "square"
-
-    block = (
-        f"\n\n--- Image Resolution ---\n"
-        f"Final output resolution: {width}x{height} ({orientation}, {ratio_w}:{ratio_h} aspect ratio)\n"
-        f"Frame your description to suit this orientation."
-    )
-
-    if hires and base_width > 0 and base_height > 0:
-        base_gcd = __import__("math").gcd(base_width, base_height)
-        base_ratio_w, base_ratio_h = base_width // base_gcd, base_height // base_gcd
-        block += (
-            f"\nBase generation resolution: {base_width}x{base_height} ({base_ratio_w}:{base_ratio_h}, hires fix upscaling to final)"
-        )
-
-    return block
+        _DEBUG_LOG.write("  WARNING: could not free GPU memory (backend module unavailable)")
 
 
 def _build_negative_prompt_instruction() -> str:
@@ -269,88 +131,6 @@ def _escape_accidental_dp_syntax(original: str, enhanced: str) -> str:
     v_end = getattr(shared.opts, "dp_parser_variant_end", "}") or "}"
     wc_wrap = getattr(shared.opts, "dp_parser_wildcard_wrap", "__") or "__"
     return escape_accidental_dp_syntax(original, enhanced, v_start=v_start, v_end=v_end, wc_wrap=wc_wrap)
-
-
-def _build_dp_wildcard_instruction() -> str:
-    """Build a wildcard-preservation instruction for the LLM system prompt.
-
-    Reads the user's Dynamic Prompts settings (wildcard wrapper and variant
-    brackets) and returns a block the LLM should append to its system prompt.
-    Returns an empty string if sd-dynamic-prompts is not installed.
-    """
-    if not _dynamic_prompts_installed():
-        return ""
-
-    wc_wrap = getattr(shared.opts, "dp_parser_wildcard_wrap", "__") or "__"
-    v_start = getattr(shared.opts, "dp_parser_variant_start", "{") or "{"
-    v_end = getattr(shared.opts, "dp_parser_variant_end", "}") or "}"
-
-    return (
-        "\n\n--- Dynamic Prompts Wildcards (MUST be preserved verbatim) ---\n"
-        "The user's prompt may contain Dynamic Prompts wildcards that will be "
-        "expanded AFTER your enhancement. You MUST keep every wildcard token "
-        "exactly as written — do NOT expand, replace, or remove them.\n\n"
-        f"  Wildcard syntax: {wc_wrap}<name>{wc_wrap}  "
-        "(e.g. __style__, __artist__)\n"
-        f"  Variant syntax:  {v_start}option1|option2{v_end}  "
-        f"(e.g. {v_start}red|blue|green{v_end})\n\n"
-        "Your job is to enhance the NON-wildcard parts of the prompt while "
-        f"leaving all {wc_wrap}...{wc_wrap} and {v_start}...{v_end} tokens untouched.\n"
-    )
-
-
-def _build_base_system_prompt(
-    preset_content: str,
-    *,
-    width: int = 0,
-    height: int = 0,
-    hires: bool = False,
-    base_width: int = 0,
-    base_height: int = 0,
-) -> str:
-    """Return the preset content with optional resolution and DP instructions appended.
-
-    This is the shared base used for BOTH positive and negative enhancement calls.
-    """
-    result = preset_content
-
-    # Append resolution info if dimensions provided
-    if width > 0 and height > 0:
-        result += _build_resolution_instruction(
-            width, height,
-            hires=hires,
-            base_width=base_width,
-            base_height=base_height,
-        )
-
-    # Append Dynamic Prompts wildcard preservation note
-    dp_instruction = _build_dp_wildcard_instruction()
-    if dp_instruction:
-        result += dp_instruction
-
-    return result
-
-
-def _effective_negative_system_prompt(
-    preset_content: str,
-    *,
-    width: int = 0,
-    height: int = 0,
-    hires: bool = False,
-    base_width: int = 0,
-    base_height: int = 0,
-) -> str:
-    """System prompt for the negative-prompt enhancement call.
-
-    Same base as positive, plus the negative-enhancement instruction block.
-    """
-    return _build_base_system_prompt(
-        preset_content,
-        width=width,
-        height=height,
-        base_width=base_width,
-        base_height=base_height,
-    ) + _build_negative_prompt_instruction()
 
 
 class LlamaServerEnhance(scripts.Script):
@@ -432,24 +212,24 @@ class LlamaServerEnhance(scripts.Script):
 
     def _test_server(self) -> str:
         """UI button handler: validate the configured server without generating."""
-        _log_to_file("=" * 72)
-        _log_to_file("Test server requested from UI")
+        _DEBUG_LOG.write("=" * 72)
+        _DEBUG_LOG.write("Test server requested from UI")
 
         if getattr(shared.state, "job", ""):
             msg = "A generation is in progress - please wait for it to finish before testing."
-            _log_to_file(f"  → {msg}")
+            _DEBUG_LOG.write(f"  → {msg}")
             return msg
 
         if not _TEST_LOCK.acquire(blocking=False):
             msg = "A server test is already running - please wait for it to finish."
-            _log_to_file(f"  → {msg}")
+            _DEBUG_LOG.write(f"  → {msg}")
             return msg
 
         try:
             return self._run_server_test()
         except Exception as exc:
             logger.exception("Server test failed")
-            _log_to_file(f"  → test crashed: {exc}")
+            _DEBUG_LOG.write(f"  → test crashed: {exc}")
             return f"FAILED: unexpected error: {exc}"
         finally:
             _TEST_LOCK.release()
@@ -466,26 +246,26 @@ class LlamaServerEnhance(scripts.Script):
         binary = str(Path(server_path).resolve()) if Path(server_path).is_file() else shutil.which(server_path)
         if not binary:
             msg = f"Binary: FAILED - {server_path!r} not found. Set 'llama-server path' in Settings -> LLama Server Enhance."
-            _log_to_file(f"  → {msg}")
+            _DEBUG_LOG.write(f"  → {msg}")
             return msg
         lines.append(f"Binary: OK ({binary})")
-        _log_to_file(f"  binary: {binary}")
+        _DEBUG_LOG.write(f"  binary: {binary}")
 
         # 2. Model file check
         if not model_path or not Path(model_path).is_file():
             msg = f"Model: FAILED - {model_path or '<not set>'!r} not found. Set 'Model path' in Settings -> LLama Server Enhance."
-            _log_to_file(f"  → {msg}")
+            _DEBUG_LOG.write(f"  → {msg}")
             return "\n".join([*lines, msg])
         lines.append(f"Model: OK ({Path(model_path).name})")
-        _log_to_file(f"  model: {model_path}")
+        _DEBUG_LOG.write(f"  model: {model_path}")
 
         # 3. Live test: spawn, health check, small chat request
-        _log_to_file("  → live test: starting server")
+        _DEBUG_LOG.write("  → live test: starting server")
         _free_gpu_memory()
-        sp = _spawn_healthy_server(server_path, model_path, extra_flags, label=" (test)")
+        sp = _spawn_healthy_server(label=" (test)")
         if sp is None:
             msg = f"Server: FAILED - did not become healthy. See {_LOG_FILE} for the server's stderr."
-            _log_to_file(f"  → {msg}")
+            _DEBUG_LOG.write(f"  → {msg}")
             return "\n".join([*lines, msg])
 
         try:
@@ -499,14 +279,14 @@ class LlamaServerEnhance(scripts.Script):
         """Run one small chat request against a healthy server, appending results."""
         model_name = _discover_model_name(sp.base_url)
         lines.append(f"Server: OK (model id: {model_name})")
-        _log_to_file(f"  model id: {model_name}")
+        _DEBUG_LOG.write(f"  model id: {model_name}")
 
         t0 = time.monotonic()
         result = chat_completion_request(
             sp,
             "Reply with exactly one word: OK",
             "ping",
-            request_timeout=_read_request_timeout(),
+            request_timeout=_opts.read_request_timeout(),
             label="Test reply",
         )
         elapsed = time.monotonic() - t0
@@ -515,10 +295,10 @@ class LlamaServerEnhance(scripts.Script):
                 f"Chat: OK ({elapsed:.1f}s, {result.completion_tokens} tokens, "
                 f"{result.generation_tps:.1f} tok/s, reply: {result.content[:80]!r})"
             )
-            _log_to_file(f"  chat OK in {elapsed:.1f}s: {result.content[:200]!r}")
+            _DEBUG_LOG.write(f"  chat OK in {elapsed:.1f}s: {result.content[:200]!r}")
         else:
             lines.append(f"Chat: FAILED - {result.error}")
-            _log_to_file(f"  → chat failed: {result.error}")
+            _DEBUG_LOG.write(f"  → chat failed: {result.error}")
 
     def process(
         self,
@@ -529,14 +309,14 @@ class LlamaServerEnhance(scripts.Script):
         enhance_negative: bool,
     ):
         """Called once before any sampling. Enhance prompts here."""
-        _log_to_file("=" * 72)
-        _log_to_file(f"process() entered — enable={enable!r}, mode={enhance_mode!r}, bucket_size={bucket_size!r}, enhance_negative={enhance_negative!r}")
-        _log_to_file(f"  p.all_prompts (input)  = {p.all_prompts!r}")
-        _log_to_file(f"  p.all_negative_prompts (input) = {p.all_negative_prompts!r}")
-        _log_to_file(f"  p.n_iter = {p.n_iter}, p.batch_size = {p.batch_size}")
+        _DEBUG_LOG.write("=" * 72)
+        _DEBUG_LOG.write(f"process() entered — enable={enable!r}, mode={enhance_mode!r}, bucket_size={bucket_size!r}, enhance_negative={enhance_negative!r}")
+        _DEBUG_LOG.write(f"  p.all_prompts (input)  = {p.all_prompts!r}")
+        _DEBUG_LOG.write(f"  p.all_negative_prompts (input) = {p.all_negative_prompts!r}")
+        _DEBUG_LOG.write(f"  p.n_iter = {p.n_iter}, p.batch_size = {p.batch_size}")
 
         if not enable:
-            _log_to_file("  → disabled, skipping")
+            _DEBUG_LOG.write("  → disabled, skipping")
             return
 
         # Free GPU memory before starting llama-server so it has room for its model
@@ -549,7 +329,7 @@ class LlamaServerEnhance(scripts.Script):
             forge_preset=forge_preset,
             checkpoint_name=checkpoint_name,
         )
-        _log_to_file(f"  forge_preset={forge_preset!r}, checkpoint={checkpoint_name!r} → resolved={resolved!r}")
+        _DEBUG_LOG.write(f"  forge_preset={forge_preset!r}, checkpoint={checkpoint_name!r} → resolved={resolved!r}")
 
         if not resolved:
             mapped = ", ".join(sorted(set(FORGE_TO_PRESET_MAP.values())))
@@ -558,14 +338,14 @@ class LlamaServerEnhance(scripts.Script):
                 "LLama Enhance: skipping - Forge UI preset %r has no LLM preset (mapped: %s)",
                 forge_preset, mapped,
             )
-            _log_to_file(f"  → no preset resolved for forge_preset={forge_preset!r}, skipping")
+            _DEBUG_LOG.write(f"  → no preset resolved for forge_preset={forge_preset!r}, skipping")
             return
 
         preset_content = load_preset(resolved)
         if not preset_content:
             print(f"  Llama Enhance: skipping - preset '{resolved}' not found (look in the presets/ directory)")
             logger.warning("Preset '%s' not found, skipping enhancement", resolved)
-            _log_to_file(f"  → preset '{resolved}' not found, skipping")
+            _DEBUG_LOG.write(f"  → preset '{resolved}' not found, skipping")
             return
 
         # Some presets (FLUX / Z-Image) have no negative-prompt conditioning;
@@ -573,80 +353,72 @@ class LlamaServerEnhance(scripts.Script):
         skip_negatives = negatives_ignored(resolved)
         if enhance_negative and skip_negatives:
             print(f"  Llama Enhance: negative enhancement skipped - preset '{resolved}' ignores negative prompts (model has no negative-prompt conditioning)")
-            _log_to_file(f"  → negative enhancement skipped: preset '{resolved}' ignores negative prompts")
+            _DEBUG_LOG.write(f"  → negative enhancement skipped: preset '{resolved}' ignores negative prompts")
 
         # Determine effective output dimensions (final after hires fix)
         hires_enabled = getattr(p, "enable_hr", False)
-        final_w, final_h = _get_effective_dimensions(p)
+        final_w, final_h = get_effective_dimensions(p)
         base_w, base_h = p.width, p.height
 
-        _log_to_file(
+        _DEBUG_LOG.write(
             f"  dimensions: base={base_w}x{base_h}, "
             f"hires={hires_enabled}, final={final_w}x{final_h}"
         )
 
         # Build system prompts (preset + resolution + Dynamic Prompts wildcard note)
-        system_prompt = _build_base_system_prompt(
+        system_prompt, negative_system_prompt = _opts.build_system_prompts(
             preset_content,
             width=final_w,
             height=final_h,
             hires=hires_enabled,
             base_width=base_w,
             base_height=base_h,
+            extensions_dir=_EXTENSIONS_DIR,
+            negative_instruction=_build_negative_prompt_instruction() if enhance_negative else None,
         )
-        negative_system_prompt = _effective_negative_system_prompt(
-            preset_content,
-            width=final_w,
-            height=final_h,
-            hires=hires_enabled,
-            base_width=base_w,
-            base_height=base_h,
-        ) if enhance_negative else None
-        _log_to_file(f"  system_prompt ({len(system_prompt)} chars): {system_prompt[:200]}...")
+        _DEBUG_LOG.write(f"  system_prompt ({len(system_prompt)} chars): {system_prompt[:200]}...")
         if negative_system_prompt:
-            _log_to_file(f"  negative_system_prompt ({len(negative_system_prompt)} chars): {negative_system_prompt[:200]}...")
+            _DEBUG_LOG.write(f"  negative_system_prompt ({len(negative_system_prompt)} chars): {negative_system_prompt[:200]}...")
 
-        server_path = shared.opts.llama_enhance_server_path or "llama-server"
-        model_path = shared.opts.llama_enhance_model_path
+        model_path = _opts.read_model_path()
         if not model_path:
             print("  Llama Enhance: skipping - no model path set (Settings > LLama Server Enhance > Model path)")
             logger.warning("Model path not set, skipping enhancement")
-            _log_to_file("  → model path not set, skipping")
+            _DEBUG_LOG.write("  → model path not set, skipping")
             return
 
-        extra_flags = shared.opts.llama_enhance_extra_flags or ""
-        request_timeout = _read_request_timeout()
+        request_timeout = _opts.read_request_timeout()
         # "Once" mode: enhance a single prompt and apply to all images.
         # One shared server serves both the positive and negative requests,
         # so the model is loaded only once.
         if enhance_mode == "Once":
             original = p.all_prompts[0] if p.all_prompts else ""
             if not original.strip():
-                _log_to_file("  → Once mode: original prompt empty, skipping")
+                _DEBUG_LOG.write("  → Once mode: original prompt empty, skipping")
                 return
 
             original_negative = p.all_negative_prompts[0] if p.all_negative_prompts else ""
 
-            sp = _spawn_healthy_server(server_path, model_path, extra_flags)
+            sp = _spawn_healthy_server()
             if sp is None:
-                _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
-                _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
+                _DEBUG_LOG.write(f"  p.all_prompts (output) = {p.all_prompts!r}")
+                _DEBUG_LOG.write(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
                 return
 
             try:
                 # Step 1: Enhance positive prompt
-                _log_to_file(f"  → Once mode: enhancing positive ({len(original)} chars)")
+                _DEBUG_LOG.write(f"  → Once mode: enhancing positive ({len(original)} chars)")
                 pos_result: ChatResult = chat_completion_request(
                     sp, system_prompt, original,
                     request_timeout=request_timeout,
                 )
 
                 if not pos_result.content:
-                    _log_to_file("  → Once mode: positive enhancement failed, keeping original")
+                    _DEBUG_LOG.write("  → Once mode: positive enhancement failed, keeping original")
                     logger.info("Using original prompt (enhancement failed)")
                     print("  Using original prompt (enhancement failed)")
-                    _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
-                    _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
+                    _DEBUG_LOG.write(f"  p.all_prompts (output) = {p.all_prompts!r}")
+                    _DEBUG_LOG.write(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
                     return
 
                 enhanced_positive = pos_result.content
@@ -654,7 +426,7 @@ class LlamaServerEnhance(scripts.Script):
                 # Escape accidental DP syntax in the enhanced prompt
                 enhanced_positive = _escape_accidental_dp_syntax(original, enhanced_positive)
 
-                _log_to_file(
+                _DEBUG_LOG.write(
                     f"  → Once mode: positive enhanced ({len(enhanced_positive)} chars, "
                     f"{pos_result.completion_tokens} tokens, {pos_result.generation_tps:.1f} tok/s, "
                     f"{pos_result.total_ms:.0f}ms total)"
@@ -665,7 +437,7 @@ class LlamaServerEnhance(scripts.Script):
                 # actually uses negative prompts)
                 enhanced_negative = original_negative
                 if enhance_negative and not skip_negatives:
-                    _log_to_file(f"  → Once mode: enhancing negative ({len(original_negative)} chars)")
+                    _DEBUG_LOG.write(f"  → Once mode: enhancing negative ({len(original_negative)} chars)")
                     neg_user_prompt = _build_negative_user_prompt(enhanced_positive, original_negative)
                     neg_result: ChatResult = chat_completion_request(
                         sp, negative_system_prompt, neg_user_prompt,
@@ -679,7 +451,7 @@ class LlamaServerEnhance(scripts.Script):
                         # Escape accidental DP syntax in the enhanced negative prompt
                         enhanced_negative = _escape_accidental_dp_syntax(original_negative, enhanced_negative)
 
-                        _log_to_file(
+                        _DEBUG_LOG.write(
                             f"  → Once mode: negative enhanced ({len(enhanced_negative)} chars, "
                             f"{neg_result.completion_tokens} tokens, {neg_result.generation_tps:.1f} tok/s, "
                             f"{neg_result.total_ms:.0f}ms total)"
@@ -690,8 +462,8 @@ class LlamaServerEnhance(scripts.Script):
                 p.all_negative_prompts = [enhanced_negative] * len(p.all_negative_prompts)
                 logger.info("Prompt enhanced (Once mode): %s → %s", original[:60], enhanced_positive[:60])
                 logger.info("Negative: %s → %s", original_negative[:60], enhanced_negative[:60])
-                _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
-                _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
+                _DEBUG_LOG.write(f"  p.all_prompts (output) = {p.all_prompts!r}")
+                _DEBUG_LOG.write(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
             finally:
                 _kill_server(sp)
             # Every Once-mode path exits here (failure paths return inside the
@@ -701,32 +473,31 @@ class LlamaServerEnhance(scripts.Script):
             return
 
         # "Per image" mode: start ONE server, batch positives, then batch negatives
-        _log_to_file(f"  → Per image mode: {len(p.all_prompts)} prompt(s)")
+        _DEBUG_LOG.write(f"  → Per image mode: {len(p.all_prompts)} prompt(s)")
 
         # Collect prompts that need enhancement (skip empty ones)
         prompts_to_enhance: list[tuple[int, str]] = []
         skipped_indices: set[int] = set()
         for idx, original in enumerate(p.all_prompts):
             if not original.strip():
-                _log_to_file(f"  → prompt {idx}: empty, keeping as-is")
+                _DEBUG_LOG.write(f"  → prompt {idx}: empty, keeping as-is")
                 skipped_indices.add(idx)
             else:
                 prompts_to_enhance.append((idx, original))
 
         # If nothing to enhance, keep originals
         if not prompts_to_enhance:
-            _log_to_file("  → all prompts empty, skipping enhancement")
-            _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
+            _DEBUG_LOG.write("  → all prompts empty, skipping enhancement")
+            _DEBUG_LOG.write(f"  p.all_prompts (output) = {p.all_prompts!r}")
             return
 
         # Start a single server instance (the helper drains the pipes,
         # streams stderr into the debug log, and waits for health)
         sp = _spawn_healthy_server(
-            server_path, model_path, extra_flags,
             label=f", {len(prompts_to_enhance)} prompt(s)",
         )
         if sp is None:
-            _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
+            _DEBUG_LOG.write(f"  p.all_prompts (output) = {p.all_prompts!r}")
             return
 
         base_url = sp.base_url
@@ -734,21 +505,21 @@ class LlamaServerEnhance(scripts.Script):
         try:
             # Discover the loaded model name
             model_name = _discover_model_name(base_url)
-            _log_to_file(f"  Discovered model: {model_name}")
+            _DEBUG_LOG.write(f"  Discovered model: {model_name}")
 
             # Discover how many parallel slots the server has
             slot_count = _discover_slot_count(base_url, model_name)
-            _log_to_file(f"  Discovered {slot_count} slot(s)")
+            _DEBUG_LOG.write(f"  Discovered {slot_count} slot(s)")
 
             # Resolve the effective bucket size (max concurrent LLM requests
             # per bucket). The dropdown's Auto choice maps to the slot count.
             bucket = _parse_bucket_size(bucket_size)
             if bucket == 0:
                 bucket = slot_count
-                _log_to_file(f"  bucket size: auto → {slot_count} (server slots)")
+                _DEBUG_LOG.write(f"  bucket size: auto → {slot_count} (server slots)")
             else:
                 suffix = f" (server has {slot_count} slots - requests will queue)" if bucket > slot_count else ""
-                _log_to_file(f"  bucket size: user choice {bucket}{suffix}")
+                _DEBUG_LOG.write(f"  bucket size: user choice {bucket}{suffix}")
 
             print(f"  Model: {model_name}, Slots: {slot_count}, Bucket: {bucket}")
 
@@ -766,7 +537,7 @@ class LlamaServerEnhance(scripts.Script):
                 f"  Sending {len(prompts_to_enhance)} positive prompt(s) "
                 f"({bucket} concurrent, {num_buckets} bucket(s)) ..."
             )
-            _log_to_file(f"  → positive batch: {len(prompts_to_enhance)} prompt(s) in {num_buckets} bucket(s) of {bucket}, cross-bucket variance enabled")
+            _DEBUG_LOG.write(f"  → positive batch: {len(prompts_to_enhance)} prompt(s) in {num_buckets} bucket(s) of {bucket}, cross-bucket variance enabled")
             pos_results = _batch_chat_completions(
                 base_url, model_name, system_prompt, prompts_to_enhance,
                 max_concurrent=bucket,
@@ -786,7 +557,7 @@ class LlamaServerEnhance(scripts.Script):
 
                 result = pos_result_map.get(idx)
                 if result and result.content:
-                    _log_to_file(
+                    _DEBUG_LOG.write(
                         f"  → prompt {idx}: positive enhanced ({len(result.content)} chars, "
                         f"{result.completion_tokens} tokens, {result.generation_tps:.1f} tok/s, "
                         f"{result.total_ms:.0f}ms total)"
@@ -801,7 +572,7 @@ class LlamaServerEnhance(scripts.Script):
                     successful_indices.append(idx)
                 else:
                     error_detail = result.error if result and result.error else "no result"
-                    _log_to_file(f"  → prompt {idx}: positive enhancement failed ({error_detail}), keeping original")
+                    _DEBUG_LOG.write(f"  → prompt {idx}: positive enhancement failed ({error_detail}), keeping original")
                     logger.info("Prompt %d: using original (enhancement failed: %s)", idx + 1, error_detail)
                     print(f"  Prompt {idx + 1}: using original (enhancement failed: {error_detail})")
                     enhanced_prompts[idx] = original
@@ -834,7 +605,7 @@ class LlamaServerEnhance(scripts.Script):
                     original_negative = p.all_negative_prompts[idx] if idx < len(p.all_negative_prompts) else ""
                     result = neg_result_map.get(idx)
                     if result and result.content:
-                        _log_to_file(
+                        _DEBUG_LOG.write(
                             f"  → prompt {idx}: negative enhanced ({len(result.content)} chars, "
                             f"{result.completion_tokens} tokens, {result.generation_tps:.1f} tok/s, "
                             f"{result.total_ms:.0f}ms total)"
@@ -850,21 +621,21 @@ class LlamaServerEnhance(scripts.Script):
 
             p.all_prompts = enhanced_prompts
             p.all_negative_prompts = enhanced_negatives
-            _log_to_file(f"  p.all_prompts (output) = {p.all_prompts!r}")
-            _log_to_file(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
+            _DEBUG_LOG.write(f"  p.all_prompts (output) = {p.all_prompts!r}")
+            _DEBUG_LOG.write(f"  p.all_negative_prompts (output) = {p.all_negative_prompts!r}")
         finally:
             # Always kill the server: an unexpected exception above must not
             # leak a GPU-resident llama-server (or its port) until restart.
             _kill_server(sp)
             stderr_tail = sp.stderr_tail(3000)
             if stderr_tail.strip():
-                _log_to_file(f"  llama-server stderr (last 3000 chars):\n{stderr_tail}")
+                _DEBUG_LOG.write(f"  llama-server stderr (last 3000 chars):\n{stderr_tail}")
 
     def postprocess(self, p, processed, enable, *args):
         """Called after all processing ends. Unload SD models to free VRAM."""
         if not enable:
             return
-        _log_to_file("postprocess() — unloading SD models to free VRAM")
+        _DEBUG_LOG.write("postprocess() — unloading SD models to free VRAM")
         _free_gpu_memory()
 
 
