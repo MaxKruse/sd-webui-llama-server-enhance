@@ -23,34 +23,46 @@ from prompt_enhancer.server import _SERVER_STARTUP_TIMEOUT, spawn_healthy_server
 logger = logging.getLogger(__name__)
 
 
-def read_request_timeout() -> float:
-    """Read the per-request LLM timeout from settings (seconds)."""
+def _coerce_timeout(value, default: float, option_name: str) -> float:
+    """Coerce a settings timeout to a positive float (seconds).
+
+    Missing, non-numeric, zero or negative values fall back to the default
+    with a warning - a non-positive timeout would make the wait loop expire
+    immediately or silently change behavior (``or``-based defaults treat 0
+    as "unset" but let negatives through).
+    """
     try:
-        return float(
-            getattr(shared.opts, "llama_enhance_timeout", DEFAULT_REQUEST_TIMEOUT)
-            or DEFAULT_REQUEST_TIMEOUT
-        )
+        seconds = float(value)
     except (TypeError, ValueError):
         logger.warning(
-            "Invalid llama_enhance_timeout value - falling back to %ss",
-            DEFAULT_REQUEST_TIMEOUT,
+            "Invalid %s value %r - falling back to %ss", option_name, value, default,
         )
-        return float(DEFAULT_REQUEST_TIMEOUT)
+        return float(default)
+    if seconds <= 0:
+        logger.warning(
+            "Invalid %s value %r (must be positive) - falling back to %ss",
+            option_name, value, default,
+        )
+        return float(default)
+    return seconds
+
+
+def read_request_timeout() -> float:
+    """Read the per-request LLM timeout from settings (seconds)."""
+    return _coerce_timeout(
+        getattr(shared.opts, "llama_enhance_timeout", DEFAULT_REQUEST_TIMEOUT),
+        DEFAULT_REQUEST_TIMEOUT,
+        "llama_enhance_timeout",
+    )
 
 
 def read_startup_timeout() -> float:
     """Read the server startup timeout from settings (seconds)."""
-    try:
-        return float(
-            getattr(shared.opts, "llama_enhance_startup_timeout", _SERVER_STARTUP_TIMEOUT)
-            or _SERVER_STARTUP_TIMEOUT
-        )
-    except (TypeError, ValueError):
-        logger.warning(
-            "Invalid llama_enhance_startup_timeout value - falling back to %ss",
-            _SERVER_STARTUP_TIMEOUT,
-        )
-        return float(_SERVER_STARTUP_TIMEOUT)
+    return _coerce_timeout(
+        getattr(shared.opts, "llama_enhance_startup_timeout", _SERVER_STARTUP_TIMEOUT),
+        _SERVER_STARTUP_TIMEOUT,
+        "llama_enhance_startup_timeout",
+    )
 
 
 def read_server_path() -> str:
