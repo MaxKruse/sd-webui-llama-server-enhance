@@ -11,10 +11,6 @@ Two responsibilities:
 
 from __future__ import annotations
 
-# Legit enhanced negatives are a single line of comma-separated tags
-# (~100-250 chars). Anything longer is almost certainly an echo.
-_MAX_NEGATIVE_CHARS = 300
-
 # Minimum length of a positive-prompt fragment that counts as an echo probe.
 _ECHO_PROBE_CHARS = 60
 
@@ -36,7 +32,7 @@ def build_negative_instruction() -> str:
         "- Make sure the standard base list is present: artist name, watermark, signature, text, blurry, jpeg artifacts, chromatic aberration.\n"
         "- Add scene-relevant unwanted elements for THIS scene: things that would ruin the composition, subject, lighting, or atmosphere described in the positive prompt.\n"
         "- NEVER output the positive prompt or any part of it. NEVER repeat the user message format ('POSITIVE: ', 'NEGATIVE: '). NEVER add quality tags (masterpiece, best quality).\n"
-        "- Output ONLY the enhanced negative prompt as a single line of comma-separated tags. No natural language, no sentences, no explanations, no quotes, no markdown.\n\n"
+        "- Output ONLY the enhanced negative prompt as a single line of comma-separated tags. The output must be exactly one line - no line breaks, no paragraphs. No natural language, no sentences, no explanations, no quotes, no markdown.\n\n"
         "Example:\n"
         "POSITIVE: 1girl, solo, astronaut, ikumi <lora:Ikumi-Anima-v2-phase2:1>. Ikumi looks at the viewer while standing inside a spacecraft cabin. Warm blue lighting fills the scene.\n"
         "NEGATIVE: worst quality, low quality, score_1-3, artist name\n"
@@ -124,9 +120,6 @@ def validate_negative_output(
     upper = text.upper()
     if "POSITIVE:" in upper or "NEGATIVE:" in upper:
         return None, "output contains the user-message format"
-
-    if len(text) > _MAX_NEGATIVE_CHARS:
-        return None, f"output too long ({len(text)} chars)"
 
     # A negative that is just the original (or worse) is not an enhancement.
     # Keep it only if it actually adds something.
