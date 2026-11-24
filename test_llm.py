@@ -48,6 +48,13 @@ from prompt_enhancer.batching import (
 from prompt_enhancer.client import (
     enhance_prompt,
 )
+from prompt_enhancer.presets import (
+    NEGATIVES_IGNORED_PRESETS,
+    PRESETS_DIR,
+    list_presets,
+    load_preset,
+    negatives_ignored,
+)
 from prompt_enhancer.server import (
     _PORT_RANGE,
     _build_command,
@@ -56,13 +63,6 @@ from prompt_enhancer.server import (
     _kill_server,
     _warmup_chat_endpoint,
     spawn_healthy_server,
-)
-from prompt_enhancer.presets import (
-    NEGATIVES_IGNORED_PRESETS,
-    list_presets,
-    load_preset,
-    negatives_ignored,
-    PRESETS_DIR,
 )
 
 
@@ -116,10 +116,10 @@ def test_command_build(server_path: str, model_path: str, extra_flags: str):
     print(f"  Model:         {cmd[2]}")
     print(f"  Extra flags:   {extra_flags or '(none)'}")
 
-    print(f"\n  Full command (shell):")
+    print("\n  Full command (shell):")
     print(f"    {' '.join(cmd)}")
 
-    print(f"\n  Full command (JSON):")
+    print("\n  Full command (JSON):")
     print(f"    {json.dumps(cmd, indent=4)}")
 
     return cmd
@@ -141,7 +141,7 @@ def test_binary_exists(server_path: str):
         return True
 
     print(f"  NOT FOUND: {server_path}")
-    print(f"  Check that llama-server exists at that path or is in your PATH.")
+    print("  Check that llama-server exists at that path or is in your PATH.")
     return False
 
 
@@ -344,7 +344,7 @@ def main():
             sys.exit(1)
     elif not system_prompt:
         system_prompt = "You are a Stable Diffusion prompt enhancer. Expand the given prompt with vivid visual details. Output ONLY the enhanced prompt."
-        print(f"\n  (No preset or --system given, using fallback)")
+        print("\n  (No preset or --system given, using fallback)")
 
     _print_section("Active system prompt", system_prompt)
 
@@ -370,7 +370,8 @@ def main():
         print(f"  [{idx + 1}] {p}")
 
     # --- Command construction ---
-    cmd = test_command_build(
+    # test_command_build prints the command; the return value is unused here.
+    _ = test_command_build(
         server_path=args.server,
         model_path=args.model or "",
         extra_flags=args.flags,

@@ -20,11 +20,14 @@ from typing import Callable
 from prompt_enhancer.batching import _batch_chat_completions
 from prompt_enhancer.client import ChatResult, chat_completion_request
 from prompt_enhancer.escape import escape_accidental_dp_syntax
-from prompt_enhancer.negative import build_negative_user_prompt, validate_negative_output
+from prompt_enhancer.negative import (
+    build_negative_user_prompt,
+    validate_negative_output,
+)
 from prompt_enhancer.server import (
-    _ServerProcess,
     _discover_model_name,
     _discover_slot_count,
+    _ServerProcess,
     _warmup_chat_endpoint,
 )
 
