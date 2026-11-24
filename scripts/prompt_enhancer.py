@@ -13,13 +13,8 @@ import time
 from pathlib import Path
 
 import gradio as gr
-import modules.scripts as scripts
-from modules import script_callbacks, shared
-from modules.ui_components import InputAccordion
-from modules.processing import StableDiffusionProcessing
-
-from prompt_enhancer import settings as _settings_module
 from prompt_enhancer import opts as _opts
+from prompt_enhancer import settings as _settings_module
 from prompt_enhancer.client import chat_completion_request
 from prompt_enhancer.flow import (
     BUCKET_SIZE_AUTO,
@@ -30,14 +25,19 @@ from prompt_enhancer.flow import (
 )
 from prompt_enhancer.logfile import RotatingLog
 from prompt_enhancer.negative import build_negative_instruction
-from prompt_enhancer.prompts import get_effective_dimensions
-from prompt_enhancer.server import _ServerProcess, _discover_model_name, _kill_server
 from prompt_enhancer.presets import (
     FORGE_TO_PRESET_MAP,
     load_preset,
     negatives_ignored,
     resolve_auto_preset,
 )
+from prompt_enhancer.prompts import get_effective_dimensions
+from prompt_enhancer.server import _discover_model_name, _kill_server, _ServerProcess
+
+import modules.scripts as scripts
+from modules import script_callbacks, shared
+from modules.processing import StableDiffusionProcessing
+from modules.ui_components import InputAccordion
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +51,13 @@ _LOG_DIR = Path(__file__).resolve().parent.parent
 _LOG_FILE = _LOG_DIR / "enhance_debug.log"
 _DEBUG_LOG = RotatingLog(_LOG_FILE)
 
-# Guards the UI "Test server" button against concurrent runs.
-_TEST_LOCK = threading.Lock()
+# Serializes every user of the transient llama-server: a generation's prompt
+# enhancement (process) and the UI "Test server" button (_test_server).
+# One server at a time - concurrent spawns would double the VRAM claim and
+# race on GPU-memory freeing. The lock is always taken non-blocking: on
+# contention the test button reports busy and process() skips enhancement
+# for that generation (graceful degradation, like every other skip).
+_ENHANCE_LOCK = threading.Lock()
 
 
 def _spawn_healthy_server(label: str = ""):
@@ -170,8 +175,8 @@ class LlamaServerEnhance(scripts.Script):
             _DEBUG_LOG.write(f"  → {msg}")
             return msg
 
-        if not _TEST_LOCK.acquire(blocking=False):
-            msg = "A server test is already running - please wait for it to finish."
+        if not _ENHANCE_LOCK.acquire(blocking=False):
+            msg = "An enhancement or server test is already running - please wait for it to finish."
             _DEBUG_LOG.write(f"  → {msg}")
             return msg
 
@@ -182,7 +187,7 @@ class LlamaServerEnhance(scripts.Script):
             _DEBUG_LOG.write(f"  → test crashed: {exc}")
             return f"FAILED: unexpected error: {exc}"
         finally:
-            _TEST_LOCK.release()
+            _ENHANCE_LOCK.release()
 
     def _run_server_test(self) -> str:
         """Check binary + model, then run a live spawn/health/chat test."""
@@ -209,8 +214,9 @@ class LlamaServerEnhance(scripts.Script):
     def _check_server_prereqs(self) -> tuple[bool, list[str]]:
         """Check the configured binary and model file. Returns (ok, lines):
         a non-empty lines list is the full user-facing result on failure."""
-        server_path = shared.opts.llama_enhance_server_path or "llama-server"
-        model_path = shared.opts.llama_enhance_model_path or ""
+        # Same defensive accessors the spawn path uses (opts.py).
+        server_path = _opts.read_server_path()
+        model_path = _opts.read_model_path()
 
         # 1. Binary check
         binary = str(Path(server_path).resolve()) if Path(server_path).is_file() else shutil.which(server_path)
@@ -272,25 +278,37 @@ class LlamaServerEnhance(scripts.Script):
             _DEBUG_LOG.write("  → disabled, skipping")
             return
 
-        # Free GPU memory before starting llama-server so it has room for its model
-        _free_gpu_memory()
-
-        # Resolve preset + model path, build the flow context, run the mode
-        resolved = self._resolve_preset(enhance_negative)
-        if resolved is None:
+        # One transient llama-server at a time: if a server test (or another
+        # enhancement) holds the lock, skip this generation instead of
+        # spawning a second server next to it (VRAM).
+        if not _ENHANCE_LOCK.acquire(blocking=False):
+            msg = "  Llama Enhance: skipping - an enhancement or server test is already running (one llama-server at a time)"
+            print(msg)
+            _DEBUG_LOG.write("  → enhancement skipped: another enhancement or server test is in progress")
             return
-        preset_content, skip_negatives = resolved
 
-        ctx = self._make_flow_ctx(p, bucket_size, enhance_negative, skip_negatives, preset_content)
-        if enhance_mode == "Once":
-            new_prompts, new_negatives = run_once(ctx, p.all_prompts, p.all_negative_prompts)
-        else:
-            new_prompts, new_negatives = run_per_image(ctx, p.all_prompts, p.all_negative_prompts)
+        try:
+            # Free GPU memory before starting llama-server so it has room for its model
+            _free_gpu_memory()
 
-        if new_prompts is not None:
-            p.all_prompts = new_prompts
-            p.all_negative_prompts = new_negatives
-        self._log_output_state(p)
+            # Resolve preset + model path, build the flow context, run the mode
+            resolved = self._resolve_preset(enhance_negative)
+            if resolved is None:
+                return
+            preset_content, skip_negatives = resolved
+
+            ctx = self._make_flow_ctx(p, bucket_size, enhance_negative, skip_negatives, preset_content)
+            if enhance_mode == "Once":
+                new_prompts, new_negatives = run_once(ctx, p.all_prompts, p.all_negative_prompts)
+            else:
+                new_prompts, new_negatives = run_per_image(ctx, p.all_prompts, p.all_negative_prompts)
+
+            if new_prompts is not None:
+                p.all_prompts = new_prompts
+                p.all_negative_prompts = new_negatives
+            self._log_output_state(p)
+        finally:
+            _ENHANCE_LOCK.release()
 
     def _resolve_preset(self, enhance_negative: bool) -> tuple[str, bool] | None:
         """Resolve the LLM preset from the Forge-Neo UI preset and validate

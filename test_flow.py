@@ -19,6 +19,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from prompt_enhancer.flow import FlowContext, run_once, run_per_image
+from prompt_enhancer.server import _WARMUP_PROMPT as WARMUP
 
 passed = 0
 failed = 0
@@ -127,9 +128,6 @@ def _make_ctx(
         out=lambda msg: None,
         info=lambda msg: None,
     )
-
-
-WARMUP = "hi"  # chat user content used by _warmup_chat_endpoint
 
 
 # ---------------------------------------------------------------------------

@@ -15,57 +15,81 @@ import logging
 from pathlib import Path
 
 from modules import shared
-
 from prompt_enhancer.client import DEFAULT_REQUEST_TIMEOUT
-from prompt_enhancer.prompts import assemble_system_prompt, build_dp_wildcard_instruction
-from prompt_enhancer.server import _SERVER_STARTUP_TIMEOUT, spawn_healthy_server
+from prompt_enhancer.prompts import (
+    assemble_system_prompt,
+    build_dp_wildcard_instruction,
+)
+
+# spawn_healthy_server is imported under an alias: the settings-backed
+# wrapper below keeps the public name `spawn_healthy_server`, and a
+# same-name import would be shadowed by that def - making the wrapper
+# call itself (TypeError) instead of the server.py helper.
+from prompt_enhancer.server import (
+    _SERVER_STARTUP_TIMEOUT,
+)
+from prompt_enhancer.server import (
+    spawn_healthy_server as _spawn_server_impl,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def read_request_timeout() -> float:
-    """Read the per-request LLM timeout from settings (seconds)."""
+def _coerce_timeout(value, default: float, option_name: str) -> float:
+    """Coerce a settings timeout to a positive float (seconds).
+
+    Missing, non-numeric, zero or negative values fall back to the default
+    with a warning - a non-positive timeout would make the wait loop expire
+    immediately or silently change behavior (``or``-based defaults treat 0
+    as "unset" but let negatives through).
+    """
     try:
-        return float(
-            getattr(shared.opts, "llama_enhance_timeout", DEFAULT_REQUEST_TIMEOUT)
-            or DEFAULT_REQUEST_TIMEOUT
-        )
+        seconds = float(value)
     except (TypeError, ValueError):
         logger.warning(
-            "Invalid llama_enhance_timeout value - falling back to %ss",
-            DEFAULT_REQUEST_TIMEOUT,
+            "Invalid %s value %r - falling back to %ss", option_name, value, default,
         )
-        return float(DEFAULT_REQUEST_TIMEOUT)
+        return float(default)
+    if seconds <= 0:
+        logger.warning(
+            "Invalid %s value %r (must be positive) - falling back to %ss",
+            option_name, value, default,
+        )
+        return float(default)
+    return seconds
+
+
+def read_request_timeout() -> float:
+    """Read the per-request LLM timeout from settings (seconds)."""
+    return _coerce_timeout(
+        getattr(shared.opts, "llama_enhance_timeout", DEFAULT_REQUEST_TIMEOUT),
+        DEFAULT_REQUEST_TIMEOUT,
+        "llama_enhance_timeout",
+    )
 
 
 def read_startup_timeout() -> float:
     """Read the server startup timeout from settings (seconds)."""
-    try:
-        return float(
-            getattr(shared.opts, "llama_enhance_startup_timeout", _SERVER_STARTUP_TIMEOUT)
-            or _SERVER_STARTUP_TIMEOUT
-        )
-    except (TypeError, ValueError):
-        logger.warning(
-            "Invalid llama_enhance_startup_timeout value - falling back to %ss",
-            _SERVER_STARTUP_TIMEOUT,
-        )
-        return float(_SERVER_STARTUP_TIMEOUT)
+    return _coerce_timeout(
+        getattr(shared.opts, "llama_enhance_startup_timeout", _SERVER_STARTUP_TIMEOUT),
+        _SERVER_STARTUP_TIMEOUT,
+        "llama_enhance_startup_timeout",
+    )
 
 
 def read_server_path() -> str:
     """The llama-server binary path; defaults to 'llama-server' from PATH."""
-    return shared.opts.llama_enhance_server_path or "llama-server"
+    return getattr(shared.opts, "llama_enhance_server_path", "") or "llama-server"
 
 
 def read_model_path() -> str:
     """The configured .gguf model path ("" if unset)."""
-    return shared.opts.llama_enhance_model_path or ""
+    return getattr(shared.opts, "llama_enhance_model_path", "") or ""
 
 
 def read_extra_flags() -> str:
     """Extra llama-server flags from settings."""
-    return shared.opts.llama_enhance_extra_flags or ""
+    return getattr(shared.opts, "llama_enhance_extra_flags", "") or ""
 
 
 def read_dp_separators() -> tuple[str, str, str]:
@@ -128,7 +152,7 @@ def spawn_healthy_server(on_debug, label: str = ""):
             if line.strip():
                 on_debug(f"  [llama-server] {line}")
 
-    return spawn_healthy_server(
+    return _spawn_server_impl(
         read_server_path(),
         read_model_path(),
         read_extra_flags(),

@@ -17,7 +17,6 @@ from prompt_enhancer.escape import (  # noqa: E402
     escape_accidental_dp_syntax as _escape_accidental_dp_syntax,
 )
 
-
 # --- Test harness ---
 
 passed = 0

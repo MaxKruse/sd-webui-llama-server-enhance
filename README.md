@@ -6,16 +6,16 @@ Drop this extension into your `extensions/` folder and get per-image prompt enha
 
 ## Features
 
-- **Batch mode** - starts a single `llama-server` instance and sends all prompts in parallel, eliminating per-image startup penalties
+- **Batch mode** - starts a single `llama-server` instance and sends all prompts in strict buckets of the server's parallel slot count, eliminating per-image startup penalties
 - **Auto preset selection** - automatically selects the correct system prompt preset based on the Forge-Neo UI preset (flux, zit, anima)
 - **Hires fix aware** - provides the LLM with final output dimensions (after hires fix upscaling) so it can frame compositions appropriately
 - **Dynamic Prompts integration** - automatically escapes accidental DP syntax in LLM output; supports custom DP separators (configurable `variant_start`, `variant_end`, `wildcard_wrap`). See [Dynamic Prompts Integration](#dynamic-prompts-integration) for execution order
 - **Two enhancement modes**:
   - **Per image** - enhance each prompt individually (batch-optimized: one server, strict buckets of the server's slot count, cross-bucket variation so similar prompts don't clone)
   - **Once** - enhance one prompt and apply it to all images in the batch
-- **Test server button** - in the UI accordion: validates the binary, model file, and inference flags with a live spawn + health check + small chat request, without generating anything
+- **Test server button** - in the UI accordion: validates the binary, model file, and inference flags with a live spawn + health check + small chat request, without generating anything. Exactly one `llama-server` at a time: the button reports busy while a generation is enhancing (or another test runs), and vice versa a generation skips enhancement for that batch
 - **Accordion open = enabled** - enhancement runs only while the "LLama Server Enhance" accordion is open; closing it disables the extension for the next generation
-- **Visible skips** - if the Forge UI preset has no LLM preset mapping, the preset file is missing, the model path is unset, or the preset ignores negative prompts, the extension prints the reason in the console instead of skipping silently
+- **Visible skips** - if the Forge UI preset has no LLM preset mapping, the preset file is missing, the model path is unset, the preset ignores negative prompts, or another enhancement/server test holds the single llama-server slot, the extension prints the reason in the console instead of skipping silently
 - **OpenAI-compatible API** - works with any model that `llama-server` can load
 
 ## Installation

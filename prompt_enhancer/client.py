@@ -20,9 +20,9 @@ from urllib import error, request
 import aiohttp
 
 from prompt_enhancer.server import (
-    _ServerProcess,
     _discover_model_name,
     _kill_server,
+    _ServerProcess,
     _warmup_chat_endpoint,
     spawn_healthy_server,
 )
@@ -66,9 +66,6 @@ class ChatResult:
     def total_ms(self) -> float:
         """Total inference time in milliseconds."""
         return self.prompt_ms + self.predicted_ms
-
-    def __bool__(self):
-        return bool(self.content)
 
 
 def _completion_payload(model_name: str, system_prompt: str, user_prompt: str) -> dict:
