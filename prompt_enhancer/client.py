@@ -1,7 +1,9 @@
 """Single chat-completion requests against llama-server.
 
 Sends prompts via the OpenAI-compatible /v1/chat/completions endpoint,
-extracts the ``content`` field (reasoning_content is stripped server-side),
+extracts the ``content`` field only (a ``reasoning_content`` field, when
+present, is never read - its thinking tokens still count in
+usage.completion_tokens, so reported token numbers include them),
 and returns a ChatResult with timing stats. The request path is sync
 (urllib); the shared retry policy is also used by the aiohttp batch variant
 in ``prompt_enhancer.batching``. Server lifecycle (spawn/health/kill) lives
