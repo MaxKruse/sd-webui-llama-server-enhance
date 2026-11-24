@@ -85,6 +85,19 @@ async def _send_chat_request_async(
         return None, _describe_error(exc), exc
 
 
+def _print_final_status(index: int, result: ChatResult, last_error: str | None) -> None:
+    """Print the one-line status for a finished request."""
+    with _print_lock:
+        if result.content:
+            print(
+                f"  Prompt {index + 1} response received ({len(result.content)} chars, "
+                f"{result.completion_tokens} tokens, {result.generation_tps:.1f} tok/s)"
+            )
+        else:
+            reason = last_error or "unknown"
+            print(f"  Prompt {index + 1}: empty/failed response ({reason})")
+
+
 async def _chat_completion_async(
     session: aiohttp.ClientSession,
     base_url: str,
@@ -96,11 +109,8 @@ async def _chat_completion_async(
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
 ) -> tuple[int, ChatResult]:
     """Send one chat completion via aiohttp with the shared retry policy.
-
-    Returns (index, ChatResult). The index is included in every status line
-    because bucket requests fail concurrently and the lines would otherwise
-    be indistinguishable.
-    """
+    Returns (index, ChatResult); every status line carries the index
+    because bucket requests fail concurrently."""
     payload = _completion_payload(model_name, system_prompt, user_prompt)
 
     result = ChatResult()
@@ -133,17 +143,7 @@ async def _chat_completion_async(
     if not result.content:
         result.error = last_error or "all retries failed"
 
-    # Final status print
-    with _print_lock:
-        if result.content:
-            print(
-                f"  Prompt {index + 1} response received ({len(result.content)} chars, "
-                f"{result.completion_tokens} tokens, {result.generation_tps:.1f} tok/s)"
-            )
-        else:
-            reason = last_error or "unknown"
-            print(f"  Prompt {index + 1}: empty/failed response ({reason})")
-
+    _print_final_status(index, result, last_error)
     return index, result
 
 
@@ -172,6 +172,34 @@ def _variation_reference_block(previous_texts: list[str]) -> str:
         "environment, pose, action, and composition. Introduce fresh variation while staying "
         "faithful to the user's original intent in the current request."
     )
+
+
+async def _run_bucket(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    model_name: str,
+    bucket_system: str,
+    bucket: list[tuple[int, str]],
+    request_timeout: float,
+    bucket_num: int,
+    bucket_count: int,
+    has_reference: bool,
+) -> list[tuple[int, ChatResult]]:
+    """Run one strict bucket: all its requests finish before the next starts."""
+    logger.info(
+        "Bucket %d/%d: %d prompt(s)%s",
+        bucket_num + 1, bucket_count, len(bucket),
+        " (with previous-bucket reference)" if has_reference else "",
+    )
+    return list(await asyncio.gather(
+        *[
+            _chat_completion_async(
+                session, base_url, model_name, bucket_system, prompt, idx,
+                request_timeout=request_timeout,
+            )
+            for idx, prompt in bucket
+        ]
+    ))
 
 
 def _batch_chat_completions(
@@ -205,19 +233,9 @@ def _batch_chat_completions(
                     if has_reference
                     else system_prompt
                 )
-                logger.info(
-                    "Bucket %d/%d: %d prompt(s)%s",
-                    bucket_num + 1, len(buckets), len(bucket),
-                    " (with previous-bucket reference)" if has_reference else "",
-                )
-                results = await asyncio.gather(
-                    *[
-                        _chat_completion_async(
-                            session, base_url, model_name, bucket_system, prompt, idx,
-                            request_timeout=request_timeout,
-                        )
-                        for idx, prompt in bucket
-                    ]
+                results = await _run_bucket(
+                    session, base_url, model_name, bucket_system, bucket,
+                    request_timeout, bucket_num, len(buckets), has_reference,
                 )
                 all_results.extend(results)
                 # What the next bucket should reference: the enhanced text

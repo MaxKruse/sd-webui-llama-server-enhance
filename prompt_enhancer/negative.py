@@ -73,6 +73,21 @@ def _is_echo_of_positive(enhanced: str, positive: str) -> bool:
     return False
 
 
+def _strip_leading_marker(text: str) -> tuple[str, str | None]:
+    """Strip a stray user-message marker the model copied from its input.
+
+    Returns (cleaned_text, reason) where reason is set when the result is
+    empty after the strip.
+    """
+    for marker in ("POSITIVE:", "NEGATIVE:"):
+        if text.upper().startswith(marker):
+            text = text[len(marker):].strip()
+            break
+    if not text:
+        return "", "empty response after marker strip"
+    return text, None
+
+
 def validate_negative_output(
     positive: str,
     original_negative: str,
@@ -87,24 +102,15 @@ def validate_negative_output(
 
     Returns:
         (cleaned_output, None) on success, or (None, reason) on rejection.
-        The cleaned output has a leading 'NEGATIVE:' marker stripped if the
-        model copied the user-message format, so it can be used as-is.
+        The cleaned output has a stray leading marker stripped, so it can be
+        used as-is.
     """
-    if not enhanced:
+    if not enhanced or not enhanced.strip():
         return None, "empty response"
 
-    text = enhanced.strip()
-    if not text:
-        return None, "empty response"
-
-    # Strip a stray marker the model copied from the user message.
-    for marker in ("POSITIVE:", "NEGATIVE:"):
-        if text.upper().startswith(marker):
-            text = text[len(marker):].strip()
-            break
-
-    if not text:
-        return None, "empty response after marker strip"
+    text, dead_reason = _strip_leading_marker(enhanced.strip())
+    if dead_reason:
+        return None, dead_reason
 
     # A legit negative is a single line of comma-separated tags.
     if "\n" in text or "\r" in text:

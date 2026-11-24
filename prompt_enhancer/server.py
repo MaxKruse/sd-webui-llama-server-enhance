@@ -287,16 +287,12 @@ def spawn_healthy_server(
     """Start a llama-server and wait until it is healthy.
 
     Single spawn-wait-kill path shared by the WebUI integration,
-    ``enhance_prompt`` and the test scripts.
-
-    Progress is printed to stdout. ``on_stderr`` (optional callable)
-    receives decoded stderr chunks as they arrive; ``on_debug`` (optional
-    callable) receives the same diagnostic lines for a debug log sink, and
-    when absent the failure stderr tail goes to ``logger`` instead.
-    ``label`` is appended to the "Running llama-server" line (e.g. " (test)").
-
-    Returns the server handle, or None on failure (the server is already
-    killed in that case).
+    ``enhance_prompt`` and the test scripts. Progress is printed to stdout;
+    ``on_stderr`` receives decoded stderr chunks; ``on_debug`` receives the
+    diagnostic lines for a debug log sink (when absent the failure stderr
+    tail goes to ``logger``); ``label`` is appended to the "Running
+    llama-server" line. Returns the server handle, or None on failure (the
+    server is already killed in that case).
     """
     timeout = float(_SERVER_STARTUP_TIMEOUT if startup_timeout is None else startup_timeout)
     port = _find_free_port()
