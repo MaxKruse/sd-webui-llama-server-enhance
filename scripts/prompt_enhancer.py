@@ -27,6 +27,11 @@ from prompt_enhancer.client import (
 )
 from prompt_enhancer.escape import escape_accidental_dp_syntax
 from prompt_enhancer.logfile import RotatingLog
+from prompt_enhancer.negative import (
+    build_negative_instruction,
+    build_negative_user_prompt,
+    validate_negative_output,
+)
 from prompt_enhancer.prompts import get_effective_dimensions
 from prompt_enhancer.server import (
     _ServerProcess,
@@ -94,31 +99,6 @@ def _free_gpu_memory():
     except Exception:
         logger.warning("Could not unload SD models from GPU (non-Forge install?)", exc_info=True)
         _DEBUG_LOG.write("  WARNING: could not free GPU memory (backend module unavailable)")
-
-
-def _build_negative_prompt_instruction() -> str:
-    """Build a negative-prompt-enhancement instruction block for the LLM system prompt.
-
-    Appended to the preset when the user checks 'Also enhance negative prompt'.
-    The LLM receives the enhanced positive prompt for context and the original
-    negative prompt to enhance.
-    """
-    return (
-        "\n\n--- Negative Prompt Enhancement ---\n"
-        "You are now enhancing a NEGATIVE prompt. The user message contains:\n"
-        "  - 'POSITIVE: ' followed by the already-enhanced positive prompt (for context only)\n"
-        "  - 'NEGATIVE: ' followed by the original negative prompt to enhance\n\n"
-        "Your job: enhance the negative prompt to best complement the positive prompt.\n"
-        "Take the positive prompt into account — target unwanted elements that would"
-        "conflict with the desired output.\n\n"
-        "Output ONLY the enhanced negative prompt as a single line of text.\n"
-        "Do not include the positive prompt, explanations, or any other commentary.\n"
-    )
-
-
-def _build_negative_user_prompt(positive: str, negative: str) -> str:
-    """Format a user message for the negative-prompt-enhancement call."""
-    return f"POSITIVE: {positive}\n\nNEGATIVE: {negative}"
 
 
 def _escape_accidental_dp_syntax(original: str, enhanced: str) -> str:
@@ -374,7 +354,7 @@ class LlamaServerEnhance(scripts.Script):
             base_width=base_w,
             base_height=base_h,
             extensions_dir=_EXTENSIONS_DIR,
-            negative_instruction=_build_negative_prompt_instruction() if enhance_negative else None,
+            negative_instruction=build_negative_instruction() if enhance_negative else None,
         )
         _DEBUG_LOG.write(f"  system_prompt ({len(system_prompt)} chars): {system_prompt[:200]}...")
         if negative_system_prompt:
@@ -438,7 +418,7 @@ class LlamaServerEnhance(scripts.Script):
                 enhanced_negative = original_negative
                 if enhance_negative and not skip_negatives:
                     _DEBUG_LOG.write(f"  → Once mode: enhancing negative ({len(original_negative)} chars)")
-                    neg_user_prompt = _build_negative_user_prompt(enhanced_positive, original_negative)
+                    neg_user_prompt = build_negative_user_prompt(enhanced_positive, original_negative)
                     neg_result: ChatResult = chat_completion_request(
                         sp, negative_system_prompt, neg_user_prompt,
                         request_timeout=request_timeout,
@@ -446,17 +426,22 @@ class LlamaServerEnhance(scripts.Script):
                     )
 
                     if neg_result.content:
-                        enhanced_negative = neg_result.content
-
-                        # Escape accidental DP syntax in the enhanced negative prompt
-                        enhanced_negative = _escape_accidental_dp_syntax(original_negative, enhanced_negative)
-
-                        _DEBUG_LOG.write(
-                            f"  → Once mode: negative enhanced ({len(enhanced_negative)} chars, "
-                            f"{neg_result.completion_tokens} tokens, {neg_result.generation_tps:.1f} tok/s, "
-                            f"{neg_result.total_ms:.0f}ms total)"
+                        cleaned_negative, reject_reason = validate_negative_output(
+                            enhanced_positive, original_negative, neg_result.content
                         )
-                        print(f"  Enhanced negative (full): {enhanced_negative}")
+                        if cleaned_negative is None:
+                            _DEBUG_LOG.write(f"  → Once mode: negative rejected ({reject_reason}), keeping original")
+                            print(f"  Negative enhancement rejected ({reject_reason}) - keeping original")
+                        else:
+                            # Escape accidental DP syntax in the enhanced negative prompt
+                            enhanced_negative = _escape_accidental_dp_syntax(original_negative, cleaned_negative)
+
+                            _DEBUG_LOG.write(
+                                f"  → Once mode: negative enhanced ({len(enhanced_negative)} chars, "
+                                f"{neg_result.completion_tokens} tokens, {neg_result.generation_tps:.1f} tok/s, "
+                                f"{neg_result.total_ms:.0f}ms total)"
+                            )
+                            print(f"  Enhanced negative (full): {enhanced_negative}")
 
                 p.all_prompts = [enhanced_positive] * len(p.all_prompts)
                 p.all_negative_prompts = [enhanced_negative] * len(p.all_negative_prompts)
@@ -587,7 +572,7 @@ class LlamaServerEnhance(scripts.Script):
                 neg_prompts: list[tuple[int, str]] = []
                 for idx in successful_indices:
                     original_negative = p.all_negative_prompts[idx] if idx < len(p.all_negative_prompts) else ""
-                    neg_user_prompt = _build_negative_user_prompt(enhanced_prompts[idx], original_negative)
+                    neg_user_prompt = build_negative_user_prompt(enhanced_prompts[idx], original_negative)
                     neg_prompts.append((idx, neg_user_prompt))
 
                 print(
@@ -605,18 +590,25 @@ class LlamaServerEnhance(scripts.Script):
                     original_negative = p.all_negative_prompts[idx] if idx < len(p.all_negative_prompts) else ""
                     result = neg_result_map.get(idx)
                     if result and result.content:
-                        _DEBUG_LOG.write(
-                            f"  → prompt {idx}: negative enhanced ({len(result.content)} chars, "
-                            f"{result.completion_tokens} tokens, {result.generation_tps:.1f} tok/s, "
-                            f"{result.total_ms:.0f}ms total)"
+                        cleaned_negative, reject_reason = validate_negative_output(
+                            enhanced_prompts[idx], original_negative, result.content
                         )
+                        if cleaned_negative is None:
+                            _DEBUG_LOG.write(f"  → prompt {idx}: negative rejected ({reject_reason}), keeping original")
+                            print(f"  Negative {idx + 1} rejected ({reject_reason}) - keeping original")
+                        else:
+                            _DEBUG_LOG.write(
+                                f"  → prompt {idx}: negative enhanced ({len(cleaned_negative)} chars, "
+                                f"{result.completion_tokens} tokens, {result.generation_tps:.1f} tok/s, "
+                                f"{result.total_ms:.0f}ms total)"
+                            )
 
-                        # Escape accidental DP syntax in the enhanced negative prompt
-                        escaped_negative = _escape_accidental_dp_syntax(original_negative, result.content)
+                            # Escape accidental DP syntax in the enhanced negative prompt
+                            escaped_negative = _escape_accidental_dp_syntax(original_negative, cleaned_negative)
 
-                        logger.info("Negative %d enhanced: %s → %s", idx + 1, original_negative[:60], escaped_negative[:60])
-                        print(f"  Enhanced negative {idx + 1} (full): {escaped_negative}")
-                        enhanced_negatives[idx] = escaped_negative
+                            logger.info("Negative %d enhanced: %s → %s", idx + 1, original_negative[:60], escaped_negative[:60])
+                            print(f"  Enhanced negative {idx + 1} (full): {escaped_negative}")
+                            enhanced_negatives[idx] = escaped_negative
                     # else: keep original negative (already set as baseline)
 
             p.all_prompts = enhanced_prompts
