@@ -1,105 +1,21 @@
-"""Standalone tests for _escape_accidental_dp_syntax logic."""
+"""Standalone tests for the DP-escape logic in prompt_enhancer/escape.py.
+
+Imports the real production function (escape.py is host-independent -
+separators are explicit parameters), so the tests cannot drift from it.
+
+Run:  python test_escape.py   (exit code 1 on failure)
+"""
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 
-def _find_matching_variant_end(text: str, start: int, v_start: str, v_end: str) -> int | None:
-    same_delim = v_start == v_end
-    depth = 1
-    i = start
-    limit = len(text) - len(v_end)
-    while i <= limit:
-        if same_delim:
-            if text[i:i + len(v_end)] == v_end:
-                depth -= 1
-                if depth == 0:
-                    return i
-                i += len(v_end)
-                continue
-            if text[i:i + len(v_start)] == v_start:
-                depth += 1
-                i += len(v_start)
-                continue
-        else:
-            if text[i:i + len(v_start)] == v_start:
-                depth += 1
-                i += len(v_start)
-                continue
-            if text[i:i + len(v_end)] == v_end:
-                depth -= 1
-                if depth == 0:
-                    return i
-                i += len(v_end)
-                continue
-        i += 1
-    return None
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-
-def _extract_variant_blocks(text: str, v_start: str, v_end: str, out: set[str]) -> None:
-    i = 0
-    while i < len(text):
-        if text[i:i + len(v_start)] == v_start:
-            end_pos = _find_matching_variant_end(text, i + len(v_start), v_start, v_end)
-            if end_pos is not None:
-                full_block = text[i:end_pos + len(v_end)]
-                out.add(full_block)
-                i = end_pos + len(v_end)
-                continue
-        i += 1
-
-
-def _contains_wildcard(text: str, wc_wrap: str) -> bool:
-    if not wc_wrap:
-        return False
-    wc_len = len(wc_wrap)
-    if wc_len * 2 + 1 > len(text):
-        return False
-    first = text.find(wc_wrap)
-    if first < 0:
-        return False
-    second = text.find(wc_wrap, first + wc_len)
-    return second > first + wc_len
-
-
-def _escape_accidental_dp_syntax(
-    original: str,
-    enhanced: str,
-    *,
-    v_start: str = "{",
-    v_end: str = "}",
-    wc_wrap: str = "__",
-) -> str:
-    original_variants: set[str] = set()
-    _extract_variant_blocks(original, v_start, v_end, original_variants)
-
-    result: list[str] = []
-    i = 0
-    while i < len(enhanced):
-        if enhanced[i:i + len(v_start)] == v_start:
-            end_pos = _find_matching_variant_end(enhanced, i + len(v_start), v_start, v_end)
-            if end_pos is not None:
-                full_block = enhanced[i:end_pos + len(v_end)]
-                inner = full_block[len(v_start):-len(v_end)]
-
-                if _contains_wildcard(inner, wc_wrap):
-                    result.append(full_block)
-                    i = end_pos + len(v_end)
-                    continue
-
-                if full_block in original_variants:
-                    result.append(full_block)
-                    i = end_pos + len(v_end)
-                    continue
-
-                inner_escaped = inner.replace("|", ",")
-                result.append(f"{v_start}{inner_escaped}{v_end}")
-                i = end_pos + len(v_end)
-                continue
-
-        result.append(enhanced[i])
-        i += 1
-
-    return "".join(result)
+from prompt_enhancer.escape import (  # noqa: E402
+    escape_accidental_dp_syntax as _escape_accidental_dp_syntax,
+)
 
 
 # --- Test harness ---
